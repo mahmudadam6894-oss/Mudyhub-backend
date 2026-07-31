@@ -18,7 +18,7 @@ IF the user asks a non-educational or off-topic question (e.g., gossip, sports n
 app.post('/api/generate', async (req, res) => {
   try {
     const { prompt } = req.body;
-    const response = await ai.models.generateContent({
+    const result = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: prompt,
       config: {
@@ -26,9 +26,12 @@ app.post('/api/generate', async (req, res) => {
       }
     });
 
-    res.json({ response: response.text });
+    // Safely extract text output
+    const textOutput = result.text || (result.candidates && result.candidates[0]?.content?.parts[0]?.text) || "";
+
+    res.json({ response: textOutput });
   } catch (error) {
-    console.error(error);
+    console.error("Backend Error:", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -37,4 +40,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-        
+                  
