@@ -29,7 +29,7 @@ const MODEL_NAME = "gemini-3.6-flash";
 // SYSTEM PROMPTS — one per assistant "mode"
 // -----------------------------------------------------
 const SYSTEM_PROMPTS = {
-  // Campus Hub's academic assistant (unchanged from before)
+  // Campus Hub's academic assistant
   campus: `You are MudyCampus AI, a dedicated academic and educational assistant built specifically for tertiary students (Universities, Polytechnics, and Colleges).
 
 STRICT RULE: You are ONLY allowed to answer educational, academic, career, and school-related questions (e.g., SIWES/IT reports, assignment questions, course explanations, project topics, study plans, CV writing, and exam prep).
@@ -121,6 +121,86 @@ app.post('/api/generate', async (req, res) => {
   }
 });
 
+// -----------------------------------------------------
+// 🎯 QUIZ GENERATOR — returns 5 fresh multiple-choice questions as JSON
+// -----------------------------------------------------
+const QUIZ_SYSTEM_PROMPT = `You generate multiple-choice trivia questions for a student quiz app.
+
+Generate exactly 5 general knowledge questions covering a random mix of topics (science, technology, history, geography, current affairs, basic academics, etc.). Vary the topics each time — do not always use the same subjects.
+
+Respond with ONLY valid JSON, no markdown fences, no commentary, no extra text before or after. Use exactly this shape:
+
+{
+  "questions": [
+    {
+      "question": "string",
+      "options": ["string", "string", "string", "string"],
+      "answer": 0
+    }
+  ]
+}
+
+Rules:
+- Exactly 5 questions in the array.
+- Exactly 4 options per question.
+- "answer" is the zero-based index (0-3) of the correct option.
+- Questions must have a single unambiguous correct answer.
+- Keep questions and options concise (under 20 words each).`;
+
+function extractJsonFromText(text) {
+  // Models sometimes wrap JSON in ```json fences despite instructions —
+  // strip those defensively before parsing.
+  const cleaned = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+  return JSON.parse(cleaned);
+}
+
+function isValidQuizPayload(data) {
+  if (!data || !Array.isArray(data.questions) || data.questions.length !== 5) return false;
+  return data.questions.every(q =>
+    q &&
+    typeof q.question === "string" && q.question.trim() &&
+    Array.isArray(q.options) && q.options.length === 4 &&
+    q.options.every(o => typeof o === "string" && o.trim()) &&
+    Number.isInteger(q.answer) && q.answer >= 0 && q.answer <= 3
+  );
+}
+
+app.get('/api/quiz', async (req, res) => {
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(500).json({
+      error: "Server misconfiguration: GEMINI_API_KEY is not set in Render Environment Variables."
+    });
+  }
+
+  try {
+    const model = genAI.getGenerativeModel({
+      model: MODEL_NAME,
+      systemInstruction: QUIZ_SYSTEM_PROMPT
+    });
+
+    const result = await model.generateContent("Generate a new set of 5 quiz questions now.");
+    const rawText = result.response.text();
+
+    let quizData;
+    try {
+      quizData = extractJsonFromText(rawText);
+    } catch (parseErr) {
+      console.error("Quiz JSON parse failed. Raw text:", rawText);
+      return res.status(502).json({ error: "AI returned malformed quiz data. Please try again." });
+    }
+
+    if (!isValidQuizPayload(quizData)) {
+      console.error("Quiz payload failed validation:", JSON.stringify(quizData));
+      return res.status(502).json({ error: "AI returned an invalid quiz format. Please try again." });
+    }
+
+    res.json(quizData);
+  } catch (error) {
+    console.error("Quiz generation error:", error);
+    res.status(500).json({ error: error.message || "Failed to generate quiz." });
+  }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
@@ -140,4 +220,4 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Using model: ${MODEL_NAME}`);
 });
-            
+                
