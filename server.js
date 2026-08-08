@@ -20,6 +20,11 @@ if (!process.env.GEMINI_API_KEY) {
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
+// Current stable model as of August 2026. If this ever starts returning a
+// 404 "model not found" error again, check https://ai.google.dev/gemini-api/docs/models
+// for the current model list and update MODEL_NAME below.
+const MODEL_NAME = "gemini-3.6-flash";
+
 const systemInstruction = `You are MudyCampus AI, a dedicated academic and educational assistant built specifically for tertiary students (Universities, Polytechnics, and Colleges).
 
 STRICT RULE: You are ONLY allowed to answer educational, academic, career, and school-related questions (e.g., SIWES/IT reports, assignment questions, course explanations, project topics, study plans, CV writing, and exam prep).
@@ -41,7 +46,7 @@ app.post('/api/generate', async (req, res) => {
   }
 
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const model = genAI.getGenerativeModel({ model: MODEL_NAME });
 
     const fullPrompt = `${systemInstruction}\n\nStudent Request:\n${prompt}`;
 
@@ -67,7 +72,8 @@ app.post('/api/generate', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: "ok",
-    geminiKeyConfigured: !!process.env.GEMINI_API_KEY
+    geminiKeyConfigured: !!process.env.GEMINI_API_KEY,
+    model: MODEL_NAME
   });
 });
 
@@ -78,5 +84,5 @@ app.get('/', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Using model: ${MODEL_NAME}`);
 });
-  
