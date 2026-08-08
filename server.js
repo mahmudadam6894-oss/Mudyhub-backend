@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const app = express();
 
@@ -18,7 +18,7 @@ if (!process.env.GEMINI_API_KEY) {
   console.error("FATAL: GEMINI_API_KEY environment variable is not set in Render dashboard.");
 }
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
 const systemInstruction = `You are MudyCampus AI, a dedicated academic and educational assistant built specifically for tertiary students (Universities, Polytechnics, and Colleges).
 
@@ -41,23 +41,21 @@ app.post('/api/generate', async (req, res) => {
   }
 
   try {
-    const result = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        systemInstruction: systemInstruction
-      }
+    const model = genAI.getGenerativeModel({ 
+      model: 'gemini-1.5-flash-latest',
+      systemInstruction: systemInstruction
     });
 
-    const textOutput = result.text || (result.candidates && result.candidates[0]?.content?.parts[0]?.text) || "";
+    const result = await model.generateContent(prompt);
+    const responseText = result.response.text();
 
-    if (!textOutput) {
+    if (!responseText) {
       return res.status(502).json({
         response: "The AI model returned an empty response. Please try rephrasing your question."
       });
     }
 
-    res.json({ response: textOutput });
+    res.json({ response: responseText });
   } catch (error) {
     console.error("Backend Error:", error);
     res.status(500).json({ 
@@ -82,4 +80,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-    
