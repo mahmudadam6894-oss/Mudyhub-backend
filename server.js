@@ -1,9 +1,10 @@
 import express from 'express';
 import cors from 'cors';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenAI } from '@google/genai';
 
 const app = express();
 
+// Enable CORS for frontend requests
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -12,17 +13,18 @@ app.use(cors({
 
 app.use(express.json());
 
+// Startup environment variable check
 if (!process.env.GEMINI_API_KEY) {
-  console.error("FATAL: GEMINI_API_KEY environment variable is not set on Render.");
+  console.error("FATAL: GEMINI_API_KEY environment variable is not set in Render dashboard.");
 }
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const systemInstruction = `You are MudyCampus AI, a dedicated academic and educational assistant built specifically for tertiary students (Universities, Polytechnics, and Colleges).
 
 STRICT RULE: You are ONLY allowed to answer educational, academic, career, and school-related questions (e.g., SIWES/IT reports, assignment questions, course explanations, project topics, study plans, CV writing, and exam prep).
 
-IF the user asks a non-educational or off-topic question, respond with:
+IF the user asks a non-educational or off-topic question (e.g., gossip, sports news, relationship advice, casual chit-chat, entertainment, or irrelevant topics), respond with:
 "I am MudyCampus AI, your academic assistant. I can only help you with educational questions, assignments, SIWES reports, project topics, and study guides! Please ask a school-related question."`;
 
 app.post('/api/generate', async (req, res) => {
@@ -39,11 +41,15 @@ app.post('/api/generate', async (req, res) => {
   }
 
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-    const fullPrompt = `${systemInstruction}\n\nStudent Question:\n${prompt}`;
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        systemInstruction: systemInstruction
+      }
+    });
 
-    const result = await model.generateContent(fullPrompt);
-    const textOutput = result.response.text();
+    const textOutput = result.text || (result.candidates && result.candidates[0]?.content?.parts[0]?.text) || "";
 
     if (!textOutput) {
       return res.status(502).json({
@@ -60,6 +66,7 @@ app.post('/api/generate', async (req, res) => {
   }
 });
 
+// Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: "ok",
@@ -75,4 +82,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-      
+    
