@@ -3,13 +3,19 @@ import cors from 'cors';
 import { GoogleGenAI } from '@google/genai';
 
 const app = express();
-app.use(cors());
+
+// Enable CORS for all incoming requests from GitHub Pages
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json());
 
-// Fail loudly at startup if the key is missing, instead of silently
-// initializing a broken client that fails on every request later.
+// Check key at startup
 if (!process.env.GEMINI_API_KEY) {
-  console.error("FATAL: GEMINI_API_KEY environment variable is not set. Set it in your Render dashboard under Environment.");
+  console.error("FATAL: GEMINI_API_KEY environment variable is not set. Set it in your Render dashboard.");
 }
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -22,22 +28,21 @@ IF the user asks a non-educational or off-topic question (e.g., gossip, sports n
 "I am MudyCampus AI, your academic assistant. I can only help you with educational questions, assignments, SIWES reports, project topics, and study guides! Please ask a school-related question."`;
 
 app.post('/api/generate', async (req, res) => {
-  // Guard: catch the missing-key case explicitly before even calling Gemini
   if (!process.env.GEMINI_API_KEY) {
     return res.status(500).json({
-      error: "Server misconfiguration: GEMINI_API_KEY is not set. Contact the administrator."
+      response: "Server misconfiguration: GEMINI_API_KEY is missing on Render settings."
     });
   }
 
   const { prompt } = req.body;
 
   if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
-    return res.status(400).json({ error: "No prompt provided." });
+    return res.status(400).json({ response: "Error: No prompt provided." });
   }
 
   try {
     const result = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-1.5-flash', // Updated to valid production model name
       contents: prompt,
       config: {
         systemInstruction: systemInstruction
@@ -48,23 +53,22 @@ app.post('/api/generate', async (req, res) => {
     const textOutput = result.text || (result.candidates && result.candidates[0]?.content?.parts[0]?.text) || "";
 
     if (!textOutput) {
-      // The API call succeeded but returned no usable text — surface this
-      // as an explicit error instead of silently sending an empty string.
-      console.error("Gemini returned no text output. Raw result:", JSON.stringify(result));
+      console.error("Gemini returned no text output:", JSON.stringify(result));
       return res.status(502).json({
-        error: "The AI model returned an empty response. This may be due to content filtering or a temporary model issue — please try rephrasing your question."
+        response: "The AI model returned an empty response. Please try rephrasing your question."
       });
     }
 
     res.json({ response: textOutput });
   } catch (error) {
     console.error("Backend Error:", error);
-    res.status(500).json({ error: error.message || "An unexpected error occurred while generating the response." });
+    res.status(500).json({ 
+      response: `Backend Error: ${error.message || "An unexpected error occurred while generating the response."}` 
+    });
   }
 });
 
-// Simple health check so you (or Render) can quickly verify the server is up
-// and correctly configured, without needing a real Gemini request.
+// Health Check Route
 app.get('/health', (req, res) => {
   res.json({
     status: "ok",
@@ -72,8 +76,13 @@ app.get('/health', (req, res) => {
   });
 });
 
+app.get('/', (req, res) => {
+  res.send("MudyHub AI Server is Running!");
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Gemini API key configured: ${!!process.env.GEMINI_API_KEY}`);
 });
+        
