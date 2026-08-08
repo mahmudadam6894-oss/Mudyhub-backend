@@ -41,12 +41,11 @@ app.post('/api/generate', async (req, res) => {
   }
 
   try {
-    const model = genAI.getGenerativeModel({ 
-      model: 'gemini-1.5-flash-latest',
-      systemInstruction: systemInstruction
-    });
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-    const result = await model.generateContent(prompt);
+    const fullPrompt = `${systemInstruction}\n\nStudent Request:\n${prompt}`;
+
+    const result = await model.generateContent(fullPrompt);
     const responseText = result.response.text();
 
     if (!responseText) {
@@ -80,3 +79,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+  
