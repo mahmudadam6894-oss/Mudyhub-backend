@@ -19,7 +19,7 @@ if (!process.env.GROQ_API_KEY) {
 
 // Current Groq model. If this returns 404 later, check
 // https://console.groq.com/docs/models for the current list.
-const MODEL_NAME = "llama-3.3-70b-versatile";
+const MODEL_NAME = "openai/gpt-oss-120b";
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 // -----------------------------------------------------
