@@ -1,6 +1,5 @@
 import express from 'express';
 import cors from 'cors';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const app = express();
 
@@ -14,22 +13,19 @@ app.use(cors({
 app.use(express.json());
 
 // Startup environment variable check
-if (!process.env.GEMINI_API_KEY) {
-  console.error("FATAL: GEMINI_API_KEY environment variable is not set in Render dashboard.");
+if (!process.env.GROQ_API_KEY) {
+  console.error("FATAL: GROQ_API_KEY environment variable is not set in Render dashboard.");
 }
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-
-// Current stable model as of August 2026. If this ever starts returning a
-// 404 "model not found" error again, check https://ai.google.dev/gemini-api/docs/models
-// for the current model list and update MODEL_NAME below.
-const MODEL_NAME = "gemini-3.6-flash";
+// Current Groq model. If this returns 404 later, check
+// https://console.groq.com/docs/models for the current list.
+const MODEL_NAME = "llama-3.3-70b-versatile";
+const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 
 // -----------------------------------------------------
 // SYSTEM PROMPTS — one per assistant "mode"
 // -----------------------------------------------------
 const SYSTEM_PROMPTS = {
-  // Campus Hub's academic assistant
   campus: `You are MudyCampus AI, a dedicated academic and educational assistant built specifically for tertiary students (Universities, Polytechnics, and Colleges).
 
 STRICT RULE: You are ONLY allowed to answer educational, academic, career, and school-related questions (e.g., SIWES/IT reports, assignment questions, course explanations, project topics, study plans, CV writing, and exam prep).
@@ -37,7 +33,6 @@ STRICT RULE: You are ONLY allowed to answer educational, academic, career, and s
 IF the user asks a non-educational or off-topic question (e.g., gossip, sports news, relationship advice, casual chit-chat, entertainment, or irrelevant topics), respond with:
 "I am MudyCampus AI, your academic assistant. I can only help you with educational questions, assignments, SIWES reports, project topics, and study guides! Please ask a school-related question."`,
 
-  // MudyHub's general platform + earning + skills assistant
   platform: `You are Mudy AI, the official assistant for MudyHub — an earning and learning platform for African (especially Nigerian) students and young people.
 
 WHAT YOU HELP WITH:
@@ -60,10 +55,65 @@ TONE: Be warm, practical, and encouraging — like a knowledgeable older student
 If asked something completely unrelated to MudyHub, earning, or learning skills (e.g. medical advice, legal advice, unrelated trivia), politely redirect: mention you're focused on helping with MudyHub, earning, and skills, and ask if they have a question in that area.`
 };
 
+// -----------------------------------------------------
+// Core Groq caller
+// -----------------------------------------------------
+async function callGroq({ systemPrompt, messages, jsonMode = false }) {
+  if (!process.env.GROQ_API_KEY) {
+    throw new Error("GROQ_API_KEY is not set in Render Environment Variables.");
+  }
+
+  const body = {
+    model: MODEL_NAME,
+    messages: [
+      { role: "system", content: systemPrompt },
+      ...messages
+    ],
+    temperature: 0.7,
+    max_tokens: 1024
+  };
+
+  // Ask Groq to return valid JSON when needed (used by the quiz generator)
+  if (jsonMode) {
+    body.response_format = { type: "json_object" };
+  }
+
+  const response = await fetch(GROQ_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${process.env.GROQ_API_KEY}`
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    let errMessage = `Groq API error (${response.status})`;
+    try {
+      const parsed = JSON.parse(errText);
+      errMessage = parsed.error?.message || errMessage;
+    } catch (e) {
+      errMessage = errText || errMessage;
+    }
+    throw new Error(errMessage);
+  }
+
+  const data = await response.json();
+  const text = data.choices?.[0]?.message?.content;
+  if (!text) {
+    throw new Error("Groq returned an empty response.");
+  }
+  return text;
+}
+
+// -----------------------------------------------------
+// /api/generate — main AI endpoint (chat)
+// -----------------------------------------------------
 app.post('/api/generate', async (req, res) => {
-  if (!process.env.GEMINI_API_KEY) {
+  if (!process.env.GROQ_API_KEY) {
     return res.status(500).json({
-      response: "Server misconfiguration: GEMINI_API_KEY is not set in Render Environment Variables."
+      response: "Server misconfiguration: GROQ_API_KEY is not set in Render Environment Variables."
     });
   }
 
@@ -73,38 +123,24 @@ app.post('/api/generate', async (req, res) => {
     return res.status(400).json({ response: "Error: No prompt provided." });
   }
 
-  // Pick the system prompt for the requested mode. Defaults to "campus" so
-  // existing callers that don't send a mode keep working unchanged.
+  // Pick the system prompt for the requested mode. Defaults to "campus".
   const selectedMode = (mode === "platform") ? "platform" : "campus";
-  const systemInstruction = SYSTEM_PROMPTS[selectedMode];
+  const systemPrompt = SYSTEM_PROMPTS[selectedMode];
+
+  // Convert incoming history (role: user | model | assistant) into Groq's
+  // OpenAI-style messages array.
+  const messages = [];
+  if (Array.isArray(history) && history.length > 0) {
+    history.forEach(h => {
+      if (!h || typeof h.text !== "string" || !h.text.trim()) return;
+      const role = (h.role === "model" || h.role === "assistant") ? "assistant" : "user";
+      messages.push({ role, content: h.text });
+    });
+  }
+  messages.push({ role: "user", content: prompt });
 
   try {
-    const model = genAI.getGenerativeModel({
-      model: MODEL_NAME,
-      systemInstruction: systemInstruction
-    });
-
-    let responseText;
-
-    // If a conversation history array was sent, use multi-turn chat so the
-    // model remembers earlier messages. Otherwise fall back to a single
-    // one-shot generateContent call (this is what Campus Hub uses today).
-    if (Array.isArray(history) && history.length > 0) {
-      // Expecting history items shaped like: { role: "user" | "model", text: "..." }
-      const formattedHistory = history
-        .filter(h => h && typeof h.text === "string" && h.text.trim())
-        .map(h => ({
-          role: h.role === "assistant" || h.role === "model" ? "model" : "user",
-          parts: [{ text: h.text }]
-        }));
-
-      const chat = model.startChat({ history: formattedHistory });
-      const result = await chat.sendMessage(prompt);
-      responseText = result.response.text();
-    } else {
-      const result = await model.generateContent(prompt);
-      responseText = result.response.text();
-    }
+    const responseText = await callGroq({ systemPrompt, messages });
 
     if (!responseText) {
       return res.status(502).json({
@@ -122,13 +158,13 @@ app.post('/api/generate', async (req, res) => {
 });
 
 // -----------------------------------------------------
-// 🎯 QUIZ GENERATOR — returns 5 fresh multiple-choice questions as JSON
+// Quiz Generator — returns 5 MCQs as JSON
 // -----------------------------------------------------
 const QUIZ_SYSTEM_PROMPT = `You generate multiple-choice trivia questions for a student quiz app.
 
 Generate exactly 5 general knowledge questions covering a random mix of topics (science, technology, history, geography, current affairs, basic academics, etc.). Vary the topics each time — do not always use the same subjects.
 
-Respond with ONLY valid JSON, no markdown fences, no commentary, no extra text before or after. Use exactly this shape:
+Respond with ONLY valid JSON. Use exactly this shape:
 
 {
   "questions": [
@@ -148,8 +184,6 @@ Rules:
 - Keep questions and options concise (under 20 words each).`;
 
 function extractJsonFromText(text) {
-  // Models sometimes wrap JSON in ```json fences despite instructions —
-  // strip those defensively before parsing.
   const cleaned = text.replace(/```json/gi, "").replace(/```/g, "").trim();
   return JSON.parse(cleaned);
 }
@@ -166,20 +200,18 @@ function isValidQuizPayload(data) {
 }
 
 app.get('/api/quiz', async (req, res) => {
-  if (!process.env.GEMINI_API_KEY) {
+  if (!process.env.GROQ_API_KEY) {
     return res.status(500).json({
-      error: "Server misconfiguration: GEMINI_API_KEY is not set in Render Environment Variables."
+      error: "Server misconfiguration: GROQ_API_KEY is not set in Render Environment Variables."
     });
   }
 
   try {
-    const model = genAI.getGenerativeModel({
-      model: MODEL_NAME,
-      systemInstruction: QUIZ_SYSTEM_PROMPT
+    const rawText = await callGroq({
+      systemPrompt: QUIZ_SYSTEM_PROMPT,
+      messages: [{ role: "user", content: "Generate a new set of 5 quiz questions now." }],
+      jsonMode: true
     });
-
-    const result = await model.generateContent("Generate a new set of 5 quiz questions now.");
-    const rawText = result.response.text();
 
     let quizData;
     try {
@@ -201,11 +233,11 @@ app.get('/api/quiz', async (req, res) => {
   }
 });
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
   res.json({
     status: "ok",
-    geminiKeyConfigured: !!process.env.GEMINI_API_KEY,
+    groqKeyConfigured: !!process.env.GROQ_API_KEY,
     model: MODEL_NAME,
     modes: Object.keys(SYSTEM_PROMPTS)
   });
@@ -220,4 +252,3 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Using model: ${MODEL_NAME}`);
 });
-                
