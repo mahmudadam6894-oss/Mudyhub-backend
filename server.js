@@ -10,17 +10,29 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(express.json());
+// ⚠️ Increase JSON body limit for image uploads (base64 images are large)
+app.use(express.json({ limit: '15mb' }));
 
 // Startup environment variable check
 if (!process.env.GROQ_API_KEY) {
   console.error("FATAL: GROQ_API_KEY environment variable is not set in Render dashboard.");
 }
 
-// Current Groq model. If this returns 404 later, check
-// https://console.groq.com/docs/models for the current list.
-const MODEL_NAME = "openai/gpt-oss-120b";
+// -----------------------------------------------------
+// MODEL CONFIGURATION
+// -----------------------------------------------------
+// Change model names here if Groq deprecates them.
+// Check current models: https://console.groq.com/docs/models
+const MODELS = {
+  default:   process.env.GROQ_MODEL_DEFAULT   || "openai/gpt-oss-120b",
+  reasoning: process.env.GROQ_MODEL_REASONING || "deepseek-r1-distill-llama-70b",
+  vision:    process.env.GROQ_MODEL_VISION    || "llama-3.2-90b-vision-preview"
+};
+
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
+
+// Max image size accepted from frontend (base64 string length, ~6MB raw image)
+const MAX_IMAGE_BASE64_LENGTH = 8_000_000;
 
 // -----------------------------------------------------
 // SYSTEM PROMPTS — one per assistant "mode"
@@ -31,7 +43,9 @@ const SYSTEM_PROMPTS = {
 STRICT RULE: You are ONLY allowed to answer educational, academic, career, and school-related questions (e.g., SIWES/IT reports, assignment questions, course explanations, project topics, study plans, CV writing, and exam prep).
 
 IF the user asks a non-educational or off-topic question (e.g., gossip, sports news, relationship advice, casual chit-chat, entertainment, or irrelevant topics), respond with:
-"I am MudyCampus AI, your academic assistant. I can only help you with educational questions, assignments, SIWES reports, project topics, and study guides! Please ask a school-related question."`,
+"I am MudyCampus AI, your academic assistant. I can only help you with educational questions, assignments, SIWES reports, project topics, and study guides! Please ask a school-related question."
+
+FORMATTING: Use clean Markdown. Use **bold** for key terms, ### headings for sections, tables for comparisons, and numbered lists for steps. Never include raw code fences around normal text.`,
 
   platform: `You are Mudy AI, the official assistant for MudyHub — an earning and learning platform for African (especially Nigerian) students and young people.
 
@@ -58,22 +72,21 @@ If asked something completely unrelated to MudyHub, earning, or learning skills 
 // -----------------------------------------------------
 // Core Groq caller
 // -----------------------------------------------------
-async function callGroq({ systemPrompt, messages, jsonMode = false }) {
+async function callGroq({ systemPrompt, messages, model, jsonMode = false, maxTokens = 1024 }) {
   if (!process.env.GROQ_API_KEY) {
     throw new Error("GROQ_API_KEY is not set in Render Environment Variables.");
   }
 
   const body = {
-    model: MODEL_NAME,
+    model: model || MODELS.default,
     messages: [
       { role: "system", content: systemPrompt },
       ...messages
     ],
     temperature: 0.7,
-    max_tokens: 1024
+    max_tokens: maxTokens
   };
 
-  // Ask Groq to return valid JSON when needed (used by the quiz generator)
   if (jsonMode) {
     body.response_format = { type: "json_object" };
   }
@@ -108,7 +121,7 @@ async function callGroq({ systemPrompt, messages, jsonMode = false }) {
 }
 
 // -----------------------------------------------------
-// /api/generate — main AI endpoint (chat)
+// /api/generate — main AI endpoint (chat + think + image)
 // -----------------------------------------------------
 app.post('/api/generate', async (req, res) => {
   if (!process.env.GROQ_API_KEY) {
@@ -117,7 +130,14 @@ app.post('/api/generate', async (req, res) => {
     });
   }
 
-  const { prompt, mode, history } = req.body;
+  const {
+    prompt,
+    mode,
+    history,
+    thinkMode = false,
+    imageBase64 = null,
+    searchMode = false
+  } = req.body;
 
   if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
     return res.status(400).json({ response: "Error: No prompt provided." });
@@ -125,10 +145,14 @@ app.post('/api/generate', async (req, res) => {
 
   // Pick the system prompt for the requested mode. Defaults to "campus".
   const selectedMode = (mode === "platform") ? "platform" : "campus";
-  const systemPrompt = SYSTEM_PROMPTS[selectedMode];
+  let systemPrompt = SYSTEM_PROMPTS[selectedMode];
 
-  // Convert incoming history (role: user | model | assistant) into Groq's
-  // OpenAI-style messages array.
+  // If search mode is on, add extra guidance to system prompt
+  if (searchMode) {
+    systemPrompt += `\n\nSEARCH MODE IS ON: The user has enabled search mode. Be extra thorough and cite specific Nigerian campus context, examples, and standards where relevant. If the question relates to SIWES, mention NUBAPOLY-standard formatting.`;
+  }
+
+  // Build message history (OpenAI/Groq style)
   const messages = [];
   if (Array.isArray(history) && history.length > 0) {
     history.forEach(h => {
@@ -137,10 +161,43 @@ app.post('/api/generate', async (req, res) => {
       messages.push({ role, content: h.text });
     });
   }
-  messages.push({ role: "user", content: prompt });
+
+  // If an image is attached, build a multimodal message
+  if (imageBase64) {
+    if (typeof imageBase64 !== "string" || imageBase64.length > MAX_IMAGE_BASE64_LENGTH) {
+      return res.status(400).json({ response: "Error: Image is too large (max ~6MB)." });
+    }
+
+    // Groq expects a data URI: "data:image/jpeg;base64,..."
+    const imageUrl = imageBase64.startsWith("data:")
+      ? imageBase64
+      : `data:image/jpeg;base64,${imageBase64}`;
+
+    messages.push({
+      role: "user",
+      content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: imageUrl } }
+      ]
+    });
+  } else {
+    messages.push({ role: "user", content: prompt });
+  }
+
+  // Decide which model to use
+  let model = MODELS.default;
+  let maxTokens = 1024;
+
+  if (imageBase64) {
+    model = MODELS.vision;
+    maxTokens = 2048; // Vision answers tend to be longer
+  } else if (thinkMode) {
+    model = MODELS.reasoning;
+    maxTokens = 3072; // Reasoning models need more room
+  }
 
   try {
-    const responseText = await callGroq({ systemPrompt, messages });
+    const responseText = await callGroq({ systemPrompt, messages, model, maxTokens });
 
     if (!responseText) {
       return res.status(502).json({
@@ -148,12 +205,23 @@ app.post('/api/generate', async (req, res) => {
       });
     }
 
-    res.json({ response: responseText });
+    res.json({
+      response: responseText,
+      usedModel: model,
+      mode: thinkMode ? "think" : (imageBase64 ? "vision" : "text")
+    });
   } catch (error) {
     console.error("Backend Error:", error);
-    res.status(500).json({
-      response: `Backend Error: ${error.message || "An unexpected error occurred."}`
-    });
+
+    // Friendly message for common Groq errors
+    let userMsg = error.message || "An unexpected error occurred.";
+    if (userMsg.toLowerCase().includes("rate limit") || userMsg.includes("429")) {
+      userMsg = "Mudy AI is busy right now. Please try again in a moment.";
+    } else if (userMsg.toLowerCase().includes("model") && userMsg.toLowerCase().includes("not found")) {
+      userMsg = "AI model unavailable. Please contact support.";
+    }
+
+    res.status(500).json({ response: `Backend Error: ${userMsg}` });
   }
 });
 
@@ -233,13 +301,20 @@ app.get('/api/quiz', async (req, res) => {
   }
 });
 
+// -----------------------------------------------------
 // Health check
+// -----------------------------------------------------
 app.get('/health', (req, res) => {
   res.json({
     status: "ok",
     groqKeyConfigured: !!process.env.GROQ_API_KEY,
-    model: MODEL_NAME,
-    modes: Object.keys(SYSTEM_PROMPTS)
+    models: MODELS,
+    modes: Object.keys(SYSTEM_PROMPTS),
+    features: {
+      think: true,
+      vision: true,
+      search: true
+    }
   });
 });
 
@@ -250,5 +325,5 @@ app.get('/', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Using model: ${MODEL_NAME}`);
+  console.log(`Models:`, MODELS);
 });
