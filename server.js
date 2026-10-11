@@ -58,7 +58,7 @@ TABLE FORMATTING: When you use tables, follow these rules:
 - Use as many columns as the content genuinely needs. For simple comparisons, 2-4 columns is ideal. For formulas, data, or detailed comparisons, use as many columns as needed.
 - Keep cell content SHORT. Aim for under 8 words per cell.
 - Never put line breaks inside a cell.
-- Always leave a blank line before and after a table.`,,
+- Always leave a blank line before and after a table.`,
 
   platform: `You are Mudy AI, the official assistant for MudyHub — an earning and learning platform for African (especially Nigerian) students and young people.
 
