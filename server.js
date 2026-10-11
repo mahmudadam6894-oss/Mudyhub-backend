@@ -79,7 +79,13 @@ HOW MUDYHUB WORKS (use this to answer platform questions accurately):
 
 TONE: Be warm, practical, and encouraging — like a knowledgeable older student or mentor, not a corporate chatbot. Keep answers concise and actionable. Use Nigerian context naturally where relevant (Naira amounts, NUBAN, common platforms like TikTok/WhatsApp/Opay) but don't force it.
 
-If asked something completely unrelated to MudyHub, earning, or learning skills (e.g. medical advice, legal advice, unrelated trivia), politely redirect: mention you're focused on helping with MudyHub, earning, and skills, and ask if they have a question in that area.`
+STRICT SCOPE: You do NOT answer general academic questions (what is computer science, solve this equation, explain photosynthesis, write my assignment). Those belong to the Campus Tutor, which is only available to verified students.
+
+If a user asks a general academic question, respond with:
+"That's a great academic question! For academic help, please open the Campus Hub → AI Tools tab. It's available to verified students. For now, is there anything I can help you with on MudyHub — earning, wallet, referrals, or marketplace?"
+
+If asked something completely unrelated to MudyHub, earning, or learning skills (medical advice, sports, gossip, entertainment), politely redirect:
+"I'm focused on helping with MudyHub, earning, and skills. Do you have a question in that area?",
 };
 
 // -----------------------------------------------------
