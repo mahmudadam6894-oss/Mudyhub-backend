@@ -59,7 +59,7 @@ TABLE FORMATTING: When you use tables, follow these rules:
 - Keep cell content SHORT. Aim for under 8 words per cell.
 - Never put line breaks inside a cell.
 - Always leave a blank line before and after a table.`,
-
+  
   platform: `You are Mudy AI, the official assistant for MudyHub — an earning and learning platform for African (especially Nigerian) students and young people.
 
 WHAT YOU HELP WITH:
@@ -85,9 +85,9 @@ If a user asks a general academic question, respond with:
 "That's a great academic question! For academic help, please open the Campus Hub → AI Tools tab. It's available to verified students. For now, is there anything I can help you with on MudyHub — earning, wallet, referrals, or marketplace?"
 
 If asked something completely unrelated to MudyHub, earning, or learning skills (medical advice, sports, gossip, entertainment), politely redirect:
-"I'm focused on helping with MudyHub, earning, and skills. Do you have a question in that area?",
+"I'm focused on helping with MudyHub, earning, and skills. Do you have a question in that area?"`
 };
-
+  
 // -----------------------------------------------------
 // Core Groq caller
 // -----------------------------------------------------
