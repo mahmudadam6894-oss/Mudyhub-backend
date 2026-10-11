@@ -10,7 +10,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// ⚠️ Increase JSON body limit for image uploads (base64 images are large)
+// Increase JSON body limit for image uploads (base64 images are large)
 app.use(express.json({ limit: '15mb' }));
 
 // Startup environment variable check
@@ -21,12 +21,13 @@ if (!process.env.GROQ_API_KEY) {
 // -----------------------------------------------------
 // MODEL CONFIGURATION
 // -----------------------------------------------------
-// Change model names here if Groq deprecates them.
-// Check current models: https://console.groq.com/docs/models
+// Groq decommissions models periodically. Check current list:
+// https://console.groq.com/docs/models
+// You can override these via Render environment variables.
 const MODELS = {
   default:   process.env.GROQ_MODEL_DEFAULT   || "openai/gpt-oss-120b",
-  reasoning: process.env.GROQ_MODEL_REASONING || "deepseek-r1-distill-llama-70b",
-  vision:    process.env.GROQ_MODEL_VISION    || "llama-3.2-90b-vision-preview"
+  reasoning: process.env.GROQ_MODEL_REASONING || "openai/gpt-oss-120b",
+  vision:    process.env.GROQ_MODEL_VISION    || "meta-llama/llama-4-scout-17b-16e-instruct"
 };
 
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
@@ -35,7 +36,7 @@ const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const MAX_IMAGE_BASE64_LENGTH = 8_000_000;
 
 // -----------------------------------------------------
-// SYSTEM PROMPTS — one per assistant "mode"
+// SYSTEM PROMPTS
 // -----------------------------------------------------
 const SYSTEM_PROMPTS = {
   campus: `You are MudyCampus AI, a dedicated academic and educational assistant built specifically for tertiary students (Universities, Polytechnics, and Colleges).
@@ -143,16 +144,13 @@ app.post('/api/generate', async (req, res) => {
     return res.status(400).json({ response: "Error: No prompt provided." });
   }
 
-  // Pick the system prompt for the requested mode. Defaults to "campus".
   const selectedMode = (mode === "platform") ? "platform" : "campus";
   let systemPrompt = SYSTEM_PROMPTS[selectedMode];
 
-  // If search mode is on, add extra guidance to system prompt
   if (searchMode) {
-    systemPrompt += `\n\nSEARCH MODE IS ON: The user has enabled search mode. Be extra thorough and cite specific Nigerian campus context, examples, and standards where relevant. If the question relates to SIWES, mention NUBAPOLY-standard formatting.`;
+    systemPrompt += `\n\nSEARCH MODE IS ON: Be extra thorough. Cite specific Nigerian campus context, examples, and standards where relevant.`;
   }
 
-  // Build message history (OpenAI/Groq style)
   const messages = [];
   if (Array.isArray(history) && history.length > 0) {
     history.forEach(h => {
@@ -162,13 +160,11 @@ app.post('/api/generate', async (req, res) => {
     });
   }
 
-  // If an image is attached, build a multimodal message
   if (imageBase64) {
     if (typeof imageBase64 !== "string" || imageBase64.length > MAX_IMAGE_BASE64_LENGTH) {
       return res.status(400).json({ response: "Error: Image is too large (max ~6MB)." });
     }
 
-    // Groq expects a data URI: "data:image/jpeg;base64,..."
     const imageUrl = imageBase64.startsWith("data:")
       ? imageBase64
       : `data:image/jpeg;base64,${imageBase64}`;
@@ -184,16 +180,15 @@ app.post('/api/generate', async (req, res) => {
     messages.push({ role: "user", content: prompt });
   }
 
-  // Decide which model to use
   let model = MODELS.default;
   let maxTokens = 1024;
 
   if (imageBase64) {
     model = MODELS.vision;
-    maxTokens = 2048; // Vision answers tend to be longer
+    maxTokens = 2048;
   } else if (thinkMode) {
     model = MODELS.reasoning;
-    maxTokens = 3072; // Reasoning models need more room
+    maxTokens = 3072;
   }
 
   try {
@@ -213,7 +208,6 @@ app.post('/api/generate', async (req, res) => {
   } catch (error) {
     console.error("Backend Error:", error);
 
-    // Friendly message for common Groq errors
     let userMsg = error.message || "An unexpected error occurred.";
     if (userMsg.toLowerCase().includes("rate limit") || userMsg.includes("429")) {
       userMsg = "Mudy AI is busy right now. Please try again in a moment.";
@@ -230,7 +224,7 @@ app.post('/api/generate', async (req, res) => {
 // -----------------------------------------------------
 const QUIZ_SYSTEM_PROMPT = `You generate multiple-choice trivia questions for a student quiz app.
 
-Generate exactly 5 general knowledge questions covering a random mix of topics (science, technology, history, geography, current affairs, basic academics, etc.). Vary the topics each time — do not always use the same subjects.
+Generate exactly 5 general knowledge questions covering a random mix of topics (science, technology, history, geography, current affairs, basic academics, etc.). Vary the topics each time.
 
 Respond with ONLY valid JSON. Use exactly this shape:
 
