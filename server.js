@@ -11,7 +11,7 @@ app.use(cors({
 }));
 
 // Increase JSON body limit for image uploads (base64 images are large)
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 // Startup environment variable check
 if (!process.env.GROQ_API_KEY) {
