@@ -329,6 +329,439 @@ app.get('/health', (req, res) => {
     }
   });
 });
+// ============================================================================
+// SIWES REPORT GENERATOR
+// ============================================================================
+import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, ImageRun, Table, TableRow, TableCell, WidthType, BorderStyle } from "docx";
+
+// -----------------------------------------------------
+// Chapter prompts — each chapter gets its own Groq call
+// -----------------------------------------------------
+function buildChapterPrompts(form) {
+    const f = form;
+    const blank = (v) => (v && v.trim && v.trim()) ? v : "Not provided";
+
+    return [
+        {
+            chapterNum: 1,
+            title: "CHAPTER ONE: INTRODUCTION",
+            prompt: `Write CHAPTER ONE of a Nigerian SIWES technical report in formal academic English.
+
+STRUCTURE (use these exact subheadings as bold headings):
+1.1 Definition of SIWES
+1.2 Brief History of SIWES
+1.3 Importance and Purpose of SIWES
+1.4 Aim and Objectives of SIWES
+1.5 Bodies Involved in the Management of SIWES and Their Roles
+
+Student context:
+- Name: ${blank(f.fullName)}
+- Institution: ${blank(f.institution)}
+- Department: ${blank(f.dept)}
+- Level: ${blank(f.level)}
+
+Write 1,200-1,500 words. Use formal Nigerian polytechnic academic English. Reference real facts about SIWES (established under ITF Act, coordinated by ITF/NUC/NBTE, etc.). Do not invent sources. End with "---" on its own line.`
+        },
+        {
+            chapterNum: 2,
+            title: "CHAPTER TWO: ORGANISATION PROFILE",
+            prompt: `Write CHAPTER TWO of a Nigerian SIWES report about the organisation where the student did their attachment.
+
+STRUCTURE (use these exact subheadings):
+2.1 Brief History of the Organisation
+2.2 Mission of the Organisation
+2.3 Vision of the Organisation
+2.4 Organisational Chart and Structure
+2.5 Roles Performed by the Organisation
+
+Student context:
+- Organisation: ${blank(f.orgName)}
+- Address: ${blank(f.orgAddress)}
+- Sector: ${blank(f.orgSector)}
+- Student's unit: ${blank(f.orgUnit)}
+- Student's role: ${blank(f.jobRole)}
+- History provided: ${blank(f.orgHistory)}
+- Mission provided: ${blank(f.orgMission)}
+- Vision provided: ${blank(f.orgVision)}
+
+Write 1,200-1,500 words. Where the student provided specific details, use them. Where details are missing, write plausible general descriptions but do NOT invent specific facts like founding dates or CEO names. End with "---" on its own line.`
+        },
+        {
+            chapterNum: 3,
+            title: "CHAPTER THREE: WORK EXPERIENCE",
+            prompt: `Write CHAPTER THREE of a Nigerian SIWES report describing the student's practical work experience.
+
+STRUCTURE:
+3.1 Introduction to the Work Experience
+3.2 Daily Routine and Work Schedule
+3.3 Month-by-Month Activities
+3.4 Tools, Software and Equipment Used
+3.5 Trainings, Meetings and Workshops Attended
+3.6 Projects Undertaken
+3.7 Achievements
+
+Student context:
+- Job role: ${blank(f.jobRole)}
+- Work hours: ${blank(f.workHours)}
+- Month 1: ${blank(f.month1)}
+- Month 2: ${blank(f.month2)}
+- Month 3: ${blank(f.month3)}
+- Month 4: ${blank(f.month4)}
+- Tools used: ${blank(f.tools)}
+- Trainings attended: ${blank(f.trainings)}
+- Project title: ${blank(f.projectTitle)}
+- Project description: ${blank(f.projectDesc)}
+- Student's contribution: ${blank(f.projectContribution)}
+- Project tools: ${blank(f.projectTools)}
+- Biggest achievement: ${blank(f.achievement)}
+- Commendation: ${blank(f.award)}
+
+Write 2,500-3,000 words. Elaborate on each month using the student's specific answers. Make it vivid and detailed. Use tables where useful (e.g. a table of tools). End with "---" on its own line.`
+        },
+        {
+            chapterNum: 4,
+            title: "CHAPTER FOUR: CHALLENGES AND SOLUTIONS",
+            prompt: `Write CHAPTER FOUR of a Nigerian SIWES report about the challenges the student faced and how they were solved.
+
+STRUCTURE:
+4.1 Introduction
+4.2 Technical Challenges Faced
+4.3 Solutions to Technical Challenges
+4.4 Interpersonal Challenges
+4.5 Logistical Challenges (Transport, Accommodation, etc.)
+4.6 Lessons Learned From These Challenges
+
+Student context:
+- Challenge 1: ${blank(f.challenge1)}
+- Solution 1: ${blank(f.challenge1Solution)}
+- Challenge 2: ${blank(f.challenge2)}
+- Solution 2: ${blank(f.challenge2Solution)}
+- Interpersonal challenges: ${blank(f.challengeInterpersonal)}
+- Logistics challenges: ${blank(f.challengeLogistics)}
+- Lessons learned: ${blank(f.challengeLessons)}
+
+Write 1,200-1,500 words. Elaborate on each challenge with real-world examples. Use the student's specific details. End with "---" on its own line.`
+        },
+        {
+            chapterNum: 5,
+            title: "CHAPTER FIVE: SUMMARY, CONCLUSION AND RECOMMENDATIONS",
+            prompt: `Write CHAPTER FIVE of a Nigerian SIWES report.
+
+STRUCTURE:
+5.1 Summary
+5.2 Conclusion
+5.3 Recommendations
+5.4 References
+
+Student context:
+- Technical skills acquired: ${blank(f.technicalSkills)}
+- Soft skills acquired: ${blank(f.softSkills)}
+- How it relates to course of study: ${blank(f.relevance)}
+- Advice for future students: ${blank(f.advice)}
+- Recommendations: ${blank(f.recommendations)}
+
+Write 800-1,000 words. For the References section (5.4), provide 5-8 generic academic references in APA format related to SIWES/industrial training/engineering/IT — use real book/paper titles that actually exist (e.g., ITF publications, textbooks on industrial training). End with "---" on its own line.`
+        }
+    ];
+}
+
+// -----------------------------------------------------
+// Call Groq for one chapter (non-streaming, long output)
+// -----------------------------------------------------
+async function generateChapter(prompt, maxTokens = 4096) {
+    const response = await fetch(GROQ_API_URL, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${process.env.GROQ_API_KEY}`
+        },
+        body: JSON.stringify({
+            model: MODELS.default,
+            messages: [
+                { role: "system", content: "You are an expert Nigerian academic report writer. You produce clean, formal, well-structured SIWES technical reports. Never use LaTeX. Never use markdown code fences. Use plain text with bold headings written in CAPITAL LETTERS. Never include intro like 'Sure, here is...'. Start directly with the content." },
+                { role: "user", content: prompt }
+            ],
+            temperature: 0.65,
+            max_tokens: maxTokens
+        })
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`Groq ${response.status}: ${errText}`);
+    }
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content || "";
+}
+
+// -----------------------------------------------------
+// Helpers — DOCX building blocks
+// -----------------------------------------------------
+function dataUriToBuffer(dataUri) {
+    const base64 = dataUri.split(",")[1];
+    return Buffer.from(base64, "base64");
+}
+
+function para(text, opts = {}) {
+    return new Paragraph({
+        alignment: opts.center ? AlignmentType.CENTER : AlignmentType.LEFT,
+        spacing: { after: 120, line: 360 },
+        children: [
+            new TextRun({
+                text,
+                bold: !!opts.bold,
+                italics: !!opts.italic,
+                size: opts.size || 24, // 12pt
+                font: "Times New Roman"
+            })
+        ]
+    });
+}
+
+function heading(text, level = 1) {
+    const sizes = { 1: 32, 2: 28, 3: 26 };
+    return new Paragraph({
+        spacing: { before: 240, after: 120, line: 360 },
+        children: [
+            new TextRun({
+                text,
+                bold: true,
+                size: sizes[level] || 26,
+                font: "Times New Roman"
+            })
+        ]
+    });
+}
+
+function pageBreak() {
+    return new Paragraph({ children: [new TextRun({ text: "", break: 1 })] });
+}
+
+// -----------------------------------------------------
+// Parse chapter text — split into paragraphs & headings
+// -----------------------------------------------------
+function renderChapterBody(chapterText) {
+    const out = [];
+    const lines = chapterText.split(/\r?\n/);
+
+    for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        if (line === "---") continue;
+
+        // Detect heading — lines that start with number.number or are ALL CAPS short
+        const isNumberedHeading = /^\d+\.\d+(\.\d+)?\s+[A-Z]/.test(line);
+        const isAllCapsHeading = line.length < 80 && line === line.toUpperCase() && /[A-Z]/.test(line);
+
+        if (isNumberedHeading || isAllCapsHeading) {
+            out.push(heading(line, 2));
+        } else {
+            out.push(para(line));
+        }
+    }
+
+    return out;
+}
+
+// -----------------------------------------------------
+// Main endpoint
+// -----------------------------------------------------
+app.post('/api/siwes', async (req, res) => {
+    if (!process.env.GROQ_API_KEY) {
+        return res.status(500).json({ error: "GROQ_API_KEY not set on server." });
+    }
+
+    const { uid, formData, images } = req.body;
+
+    if (!uid || !formData) {
+        return res.status(400).json({ error: "Missing uid or formData." });
+    }
+
+    try {
+        console.log(`[SIWES] Starting for uid=${uid}, org=${formData.orgName}`);
+
+        const prompts = buildChapterPrompts(formData);
+        const chapters = [];
+
+        // Generate each chapter sequentially (avoid Groq rate limits)
+        for (const p of prompts) {
+            console.log(`[SIWES] Generating ${p.title}...`);
+            const text = await generateChapter(p.prompt, p.chapterNum === 3 ? 6000 : 4096);
+            chapters.push({ num: p.chapterNum, title: p.title, text });
+        }
+
+        console.log(`[SIWES] All 5 chapters generated. Building DOCX...`);
+
+        // -------------------------------------------------
+        // Build the DOCX
+        // -------------------------------------------------
+        const children = [];
+
+        // ===== COVER PAGE =====
+        children.push(para("A TECHNICAL REPORT ON STUDENT INDUSTRIAL WORK EXPERIENCE SCHEME (SIWES)", {
+            center: true, bold: true, size: 32
+        }));
+        children.push(para(""));
+        children.push(para("SUBMITTED BY", { center: true, bold: true }));
+        children.push(para(formData.fullName || "", { center: true, bold: true, size: 28 }));
+        children.push(para(formData.matric || "", { center: true }));
+        children.push(para(""));
+        children.push(para("DEPARTMENT OF " + (formData.dept || "").toUpperCase(), { center: true, bold: true }));
+        children.push(para("FACULTY OF " + (formData.faculty || "").toUpperCase(), { center: true, bold: true }));
+        children.push(para((formData.institution || "").toUpperCase(), { center: true, bold: true }));
+        children.push(para(""));
+        children.push(para(`SIWES PERIOD: ${formData.startDate || ""} TO ${formData.endDate || ""}`, { center: true }));
+        children.push(para(""));
+        children.push(para("IN PARTIAL FULFILMENT OF THE REQUIREMENTS FOR THE AWARD OF NATIONAL DIPLOMA (ND)", {
+            center: true, italic: true
+        }));
+        children.push(para(""));
+        children.push(para(new Date().toLocaleDateString("en-GB", { year: "numeric", month: "long" }), { center: true, bold: true }));
+
+        children.push(pageBreak());
+
+        // ===== DECLARATION =====
+        children.push(heading("DECLARATION", 1));
+        children.push(para(`I, ${formData.fullName || ""}, hereby declare that this SIWES technical report is my original work and has not been submitted elsewhere.`));
+        children.push(para(""));
+        children.push(para("_____________________________", {}));
+        children.push(para(formData.fullName || "", { bold: true }));
+        children.push(para(`Date: ${new Date().toLocaleDateString("en-GB")}`));
+        children.push(pageBreak());
+
+        // ===== CERTIFICATION =====
+        children.push(heading("CERTIFICATION", 1));
+        children.push(para("This is to certify that this SIWES report was carried out by the above-named student and is approved as meeting the requirements of the institution."));
+        children.push(para(""));
+        children.push(para("Industry Supervisor: " + (formData.supervisorName || "_________________")));
+        children.push(para("Position: " + (formData.supervisorPosition || "_________________")));
+        children.push(para("Signature & Date: _____________________________"));
+        children.push(para(""));
+        children.push(para("School Supervisor: _____________________________"));
+        children.push(para("Signature & Date: _____________________________"));
+        children.push(pageBreak());
+
+        // ===== DEDICATION =====
+        children.push(heading("DEDICATION", 1));
+        children.push(para("This report is dedicated to Almighty God and to my family for their support and encouragement throughout the SIWES period."));
+        children.push(pageBreak());
+
+        // ===== ACKNOWLEDGEMENT =====
+        children.push(heading("ACKNOWLEDGEMENT", 1));
+        children.push(para(`I sincerely appreciate the management and staff of ${formData.orgName || "the organisation"} for giving me the opportunity to undertake my industrial training with them. My special thanks go to ${formData.supervisorName || "my industry supervisor"} for their guidance and mentorship.`));
+        children.push(para(`I also appreciate the management of ${formData.institution || "my institution"} for facilitating this SIWES programme, and my family for their unwavering support.`));
+        children.push(pageBreak());
+
+        // ===== ABSTRACT =====
+        children.push(heading("ABSTRACT", 1));
+        children.push(para(`This report presents a detailed account of my Student Industrial Work Experience Scheme (SIWES) attachment at ${formData.orgName || "an organisation"}, undertaken from ${formData.startDate || ""} to ${formData.endDate || ""}. During this period, I was attached to the ${formData.orgUnit || "relevant"} unit where I served as a ${formData.jobRole || "student intern"}. The report covers the organisation's profile, the daily activities and projects undertaken, technical and interpersonal challenges encountered, and the lessons learned. The SIWES programme provided invaluable practical exposure that complemented the theoretical knowledge gained in the classroom, and it significantly enhanced my technical and soft skills.`));
+        children.push(pageBreak());
+
+        // ===== TABLE OF CONTENTS (simple) =====
+        children.push(heading("TABLE OF CONTENTS", 1));
+        children.push(para("Preliminary Pages .......................................... i"));
+        children.push(para("Chapter One: Introduction ................................... 1"));
+        children.push(para("Chapter Two: Organisation Profile ........................... 8"));
+        children.push(para("Chapter Three: Work Experience .............................. 15"));
+        children.push(para("Chapter Four: Challenges and Solutions ...................... 25"));
+        children.push(para("Chapter Five: Summary, Conclusion and Recommendations ....... 30"));
+        children.push(pageBreak());
+
+        // ===== CHAPTERS =====
+        for (const ch of chapters) {
+            // Chapter title
+            children.push(heading(ch.title, 1));
+            children.push(para(""));
+
+            // Optional images per chapter
+            if (images) {
+                if (ch.num === 2 && images.logo && images.logo.data) {
+                    try {
+                        const buf = dataUriToBuffer(images.logo.data);
+                        children.push(new Paragraph({
+                            alignment: AlignmentType.CENTER,
+                            children: [new ImageRun({
+                                data: buf,
+                                transformation: { width: 200, height: 200 }
+                            })]
+                        }));
+                        children.push(para("Figure 2.1: Organisation Logo", { center: true, italic: true, size: 20 }));
+                    } catch (e) { console.error("Logo image error:", e); }
+                }
+
+                if (ch.num === 3) {
+                    const workImgs = [images.work1, images.work2, images.work3].filter(i => i && i.data);
+                    let figN = 1;
+                    for (const img of workImgs) {
+                        try {
+                            const buf = dataUriToBuffer(img.data);
+                            children.push(new Paragraph({
+                                alignment: AlignmentType.CENTER,
+                                children: [new ImageRun({
+                                    data: buf,
+                                    transformation: { width: 400, height: 300 }
+                                })]
+                            }));
+                            children.push(para(`Figure 3.${figN}: Author at work`, { center: true, italic: true, size: 20 }));
+                            figN++;
+                        } catch (e) { console.error("Work image error:", e); }
+                    }
+
+                    const projImgs = [images.project1, images.project2].filter(i => i && i.data);
+                    for (const img of projImgs) {
+                        try {
+                            const buf = dataUriToBuffer(img.data);
+                            children.push(new Paragraph({
+                                alignment: AlignmentType.CENTER,
+                                children: [new ImageRun({
+                                    data: buf,
+                                    transformation: { width: 400, height: 300 }
+                                })]
+                            }));
+                            children.push(para(`Figure 3.${figN}: Project screenshot`, { center: true, italic: true, size: 20 }));
+                            figN++;
+                        } catch (e) { console.error("Project image error:", e); }
+                    }
+                }
+            }
+
+            // Chapter body
+            const bodyParas = renderChapterBody(ch.text);
+            bodyParas.forEach(p => children.push(p));
+
+            children.push(pageBreak());
+        }
+
+        // -------------------------------------------------
+        // Pack and send
+        // -------------------------------------------------
+        const doc = new Document({
+            creator: formData.fullName || "MudyHub Student",
+            title: "SIWES Technical Report",
+            sections: [{
+                properties: {
+                    page: {
+                        margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 } // 1 inch
+                    }
+                },
+                children
+            }]
+        });
+
+        const buffer = await Packer.toBuffer(doc);
+
+        res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+        res.setHeader("Content-Disposition", `attachment; filename="SIWES_Report_${formData.matric || uid}.docx"`);
+        res.send(buffer);
+
+        console.log(`[SIWES] ✅ Report sent for uid=${uid}, size=${buffer.length} bytes`);
+    } catch (error) {
+        console.error("[SIWES] Error:", error);
+        res.status(500).json({
+            error: error.message || "Failed to generate SIWES report."
+        });
+    }
+});
 
 app.get('/', (req, res) => {
   res.send("MudyHub AI Server is Live!");
@@ -339,3 +772,4 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Models:`, MODELS);
 });
+
