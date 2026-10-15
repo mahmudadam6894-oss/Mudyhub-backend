@@ -1,18 +1,19 @@
 {
-  "name": "mudyhub-backend",
-  "version": "1.0.0",
-  "description": "Backend API for MudyHub",
-  "type": "module",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "docx": "^8.5.0",
-    "express": "^4.19.2"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
+"name": "mudyhub-backend",
+"version": "1.0.0",
+"description": "Backend API for MudyHub",
+"type": "module",
+"main": "server.js",
+"scripts": {
+"start": "node server.js"
+},
+"dependencies": {
+"cors": "^2.8.5",
+"docx": "^8.5.0",
+"express": "^4.19.2",
+"firebase-admin": "^13.5.0"
+},
+"engines": {
+"node": ">=18.0.0"
+}
 }
