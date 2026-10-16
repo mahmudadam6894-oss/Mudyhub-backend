@@ -29,7 +29,7 @@ if (!process.env.GROQ_API_KEY) {
 const MODELS = {
   default:   process.env.GROQ_MODEL_DEFAULT   || "openai/gpt-oss-120b",
   reasoning: process.env.GROQ_MODEL_REASONING || "openai/gpt-oss-120b",
-  vision:    process.env.GROQ_MODEL_VISION    || "meta-llama/llama-4-scout-17b-16e-instruct"
+  vision:    process.env.GROQ_MODEL_VISION    || "qwen/qwen3.8-27b"
 };
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const MAX_IMAGE_BASE64_LENGTH = 8_000_000;
