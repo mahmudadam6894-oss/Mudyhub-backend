@@ -301,7 +301,6 @@ function getDepartmentReferences(dept) {
     "Brown, T. L., LeMay, H. E., & Bursten, B. E. (2018). Chemistry: The Central Science. Pearson.",
     itf, nbte, nuc
   ];
-  // Default
   return [itf, nbte, nuc, "Workshop notes, demonstrations, and supervised practical instruction received during the SIWES attachment."];
 }
 
@@ -376,8 +375,6 @@ Student context:
 
 Write 1,300–1,500 words. Where the student provided details, USE THEM ALL. Where missing, describe typically but do NOT invent founding dates or CEO names.
 
-For section (d) — describe the reporting structure in words (chart added separately).
-
 Write in paragraphs only. No bullet points. No markdown.`
     },
     {
@@ -411,7 +408,7 @@ Student context (USE EVERY DETAIL):
 - Award: ${b(f.award)}
 - Trained anyone: ${b(f.trainedAnyone)}
 
-Write 3,000–3,500 words. LONGEST chapter. Section (a) covers month-by-month. Section (b) is a vivid summary. Use the student's real answers everywhere.
+Write 2,000–2,500 words. Section (a) covers month-by-month. Section (b) is a vivid summary. Use the student's real answers everywhere.
 
 Write in paragraphs only. No bullet points. No markdown.`
     },
@@ -468,7 +465,7 @@ Write in paragraphs only. No bullet points. No markdown.`
   ];
 }
 
-async function generateChapter(prompt, maxTokens = 4500) {
+async function generateChapter(prompt, maxTokens = 1500) {
   return callGroq({
     systemPrompt: `You are an expert Nigerian SIWES report writer. You write reports that read like real students wrote them — using their own words, their own experiences, and their own specific details. You NEVER use markdown symbols. You write ONLY in flowing paragraphs. You start directly with the content.`,
     messages: [{ role: "user", content: prompt }],
@@ -572,9 +569,14 @@ app.post('/api/siwes', async (req, res) => {
 
     for (const p of prompts) {
       console.log(`[SIWES] Generating ${p.title}...`);
-      const tokens = p.chapterNum === 3 ? 7000 : 4500;
-      const raw = await generateChapter(p.prompt, tokens);
+      const raw = await generateChapter(p.prompt, 1500); // Max 1500 tokens per chapter
       chapters.push({ num: p.chapterNum, title: p.title, text: stripMarkdown(raw) });
+
+      // Wait 15 seconds before the next chapter to avoid rate limit
+      if (p.chapterNum < 5) {
+        console.log(`[SIWES] Waiting 15s to avoid rate limit...`);
+        await new Promise(r => setTimeout(r, 15000));
+      }
     }
 
     console.log(`[SIWES] All chapters generated. Building DOCX...`);
