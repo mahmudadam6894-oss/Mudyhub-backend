@@ -1,9 +1,12 @@
 import express from 'express';
 import cors from 'cors';
+import admin from 'firebase-admin';
+import dotenv from 'dotenv';
 import {
   Document, Packer, Paragraph, TextRun, AlignmentType, ImageRun
 } from 'docx';
 
+dotenv.config();
 const app = express();
 
 // -----------------------------------------------------
@@ -17,11 +20,28 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------
-// ENV CHECK
+// ENV CHECK & FIREBASE ADMIN SETUP (NEW)
 // -----------------------------------------------------
 if (!process.env.GROQ_API_KEY) {
   console.error("FATAL: GROQ_API_KEY environment variable is not set in Render dashboard.");
 }
+if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+  console.error("FATAL: FIREBASE_SERVICE_ACCOUNT environment variable is not set in Render dashboard.");
+}
+
+// Initialize Firebase Admin for the Mini-Bank
+try {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: "https://mudyhub-default-rtdb.firebaseio.com" // Make sure this matches your DB URL
+  });
+  console.log("✅ Firebase Admin initialized securely.");
+} catch (error) {
+  console.error("❌ Failed to initialize Firebase Admin. Check your FIREBASE_SERVICE_ACCOUNT JSON.");
+}
+
+const db = admin.database();
 
 // -----------------------------------------------------
 // MODEL CONFIG
@@ -814,6 +834,162 @@ app.post('/api/siwes', async (req, res) => {
   }
 });
 
+
+// =====================================================================
+// 🚨 NEW: MINI-BANK ROUTES (SECURE MONEY HANDLING)
+// =====================================================================
+
+       // --- A. SECURE TOP-UP (Paystack) ---
+app.post("/api/verify-topup", async (req, res) => {
+  try {
+    const idToken = req.headers.authorization?.split("Bearer ")[1];
+    if (!idToken) return res.status(401).json({ error: "Unauthorized" });
+    
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const userId = decodedToken.uid;
+
+    const { reference } = req.body;
+    if (!reference) return res.status(400).json({ error: "Reference is required" });
+
+    const paystackRes = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
+      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
+    });
+    const paystackData = await paystackRes.json();
+
+    if (!paystackData.status || paystackData.data.status !== "success") {
+      return res.status(400).json({ error: "Payment not successful on Paystack" });
+    }
+
+    const amountPaid = paystackData.data.amount / 100; // Convert Kobo to Naira
+
+    // Idempotency check
+    const topupRef = db.ref(`walletTopups/${userId}/${reference}`);
+    const snapshot = await topupRef.once("value");
+    if (snapshot.exists()) {
+      return res.status(400).json({ error: "This payment was already credited." });
+    }
+
+    // Credit wallet securely
+    const walletRef = db.ref(`users/${userId}/walletBalance`);
+    await walletRef.transaction((current) => (current || 0) + amountPaid);
+
+    // Log the topup
+    await topupRef.set({
+      amount: amountPaid,
+      reference,
+      status: "completed",
+      createdAt: admin.database.ServerValue.TIMESTAMP
+    });
+
+    // Notify user
+    await db.ref(`notifications/${userId}`).push({
+      type: "topup",
+      amount: amountPaid,
+      message: `Wallet credited with ₦${amountPaid.toLocaleString()}.`,
+      createdAt: admin.database.ServerValue.TIMESTAMP,
+      read: false
+    });
+
+    return res.status(200).json({ message: "Wallet credited", amount: amountPaid });
+
+  } catch (error) {
+    console.error("Topup Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// --- B. SECURE WITHDRAWAL (Direct to Bank) ---
+app.post("/api/withdraw", async (req, res) => {
+  try {
+    const idToken = req.headers.authorization?.split("Bearer ")[1];
+    if (!idToken) return res.status(401).json({ error: "Unauthorized" });
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const userId = decodedToken.uid;
+
+    const { amount, bankCode, accountNumber, accountName } = req.body;
+    const withdrawAmount = Number(amount);
+
+    if (withdrawAmount < 1000) return res.status(400).json({ error: "Minimum is ₦1000" });
+
+    const walletRef = db.ref(`users/${userId}/walletBalance`);
+    const walletSnap = await walletRef.once("value");
+    const currentBalance = walletSnap.val() || 0;
+    
+    if (currentBalance < withdrawAmount) {
+      return res.status(400).json({ error: "Insufficient funds" });
+    }
+
+    // Deduct wallet
+    await walletRef.transaction((current) => {
+        if (current >= withdrawAmount) return current - withdrawAmount;
+        return current;
+    });
+
+    // Create Paystack Recipient
+    const recipientRes = await fetch("https://api.paystack.co/transferrecipient", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        type: "nuban",
+        name: accountName,
+        account_number: accountNumber,
+        bank_code: bankCode,
+        currency: "NGN"
+      })
+    });
+    const recipientData = await recipientRes.json();
+
+    if (!recipientData.status) {
+        // Refund if recipient fails
+        await walletRef.transaction((current) => (current || 0) + withdrawAmount);
+        return res.status(400).json({ error: "Invalid bank details" });
+    }
+
+    // Initiate Transfer
+    const transferRes = await fetch("https://api.paystack.co/transfer", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        source: "balance",
+        amount: withdrawAmount * 100,
+        recipient: recipientData.data.recipient_code,
+        reason: "MudyHub Withdrawal"
+      })
+    });
+    const transferData = await transferRes.json();
+
+    if (!transferData.status) {
+        // Refund if transfer fails
+        await walletRef.transaction((current) => (current || 0) + withdrawAmount);
+        return res.status(400).json({ error: "Transfer failed. Funds returned." });
+    }
+
+    // Log the withdrawal
+    await db.ref(`withdrawalRequests`).push({
+      uid: userId,
+      amount: withdrawAmount,
+      bankCode,
+      accountNumber,
+      accountName,
+      status: "processing",
+      paystackRef: transferData.data.reference,
+      createdAt: admin.database.ServerValue.TIMESTAMP
+    });
+
+    return res.status(200).json({ message: "Withdrawal processing", reference: transferData.data.reference });
+
+  } catch (error) {
+    console.error("Withdraw Error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // -----------------------------------------------------
 // HEALTH CHECK
 // -----------------------------------------------------
@@ -821,14 +997,15 @@ app.get('/health', (req, res) => {
   res.json({
     status: "ok",
     groqKeyConfigured: !!process.env.GROQ_API_KEY,
+    firebaseAdminConfigured: !!process.env.FIREBASE_SERVICE_ACCOUNT,
     models: MODELS,
     modes: Object.keys(SYSTEM_PROMPTS),
-    features: { think: true, vision: true, search: true, siwes: true }
+    features: { think: true, vision: true, search: true, siwes: true, miniBank: true }
   });
 });
 
 app.get('/', (req, res) => {
-  res.send("MudyHub AI Server is Live!");
+  res.send("MudyHub AI & Mini-Bank Server is Live!");
 });
 
 const PORT = process.env.PORT || 3000;
