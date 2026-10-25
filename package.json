@@ -10,7 +10,9 @@
   "dependencies": {
     "cors": "^2.8.5",
     "docx": "^8.5.0",
-    "express": "^4.19.2"
+    "dotenv": "^16.3.1",
+    "express": "^4.19.2",
+    "firebase-admin": "^11.11.0"
   },
   "engines": {
     "node": ">=18.0.0"
