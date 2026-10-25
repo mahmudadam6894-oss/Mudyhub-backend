@@ -30,19 +30,22 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
 }
 
 // Initialize Firebase Admin for the Mini-Bank
+let db = null;
 try {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: "https://mudyhub-default-rtdb.firebaseio.com" // Make sure this matches your DB URL
-  });
-  console.log("✅ Firebase Admin initialized securely.");
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      databaseURL: "https://mudyhub-default-rtdb.firebaseio.com" // Make sure this matches your DB URL
+    });
+    db = admin.database();
+    console.log("✅ Firebase Admin initialized securely.");
+  } else {
+    console.error("❌ FATAL: FIREBASE_SERVICE_ACCOUNT is missing in Render. Mini-Bank will not work.");
+  }
 } catch (error) {
-  console.error("❌ Failed to initialize Firebase Admin. Check your FIREBASE_SERVICE_ACCOUNT JSON.");
+  console.error("❌ Failed to initialize Firebase Admin. Check your FIREBASE_SERVICE_ACCOUNT JSON.", error.message);
 }
-
-const db = admin.database();
-
 // -----------------------------------------------------
 // MODEL CONFIG
 // -----------------------------------------------------
