@@ -3,7 +3,8 @@ import cors from 'cors';
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
 import {
-  Document, Packer, Paragraph, TextRun, AlignmentType, ImageRun
+  Document, Packer, Paragraph, TextRun, AlignmentType, ImageRun,
+  PageBreak, Footer, PageNumber
 } from 'docx';
 
 dotenv.config();
@@ -20,7 +21,7 @@ app.use(cors({
 app.use(express.json({ limit: '50mb' }));
 
 // -----------------------------------------------------
-// ENV CHECK & FIREBASE ADMIN SETUP (NEW)
+// ENV CHECK & FIREBASE ADMIN SETUP
 // -----------------------------------------------------
 if (!process.env.GROQ_API_KEY) {
   console.error("FATAL: GROQ_API_KEY environment variable is not set in Render dashboard.");
@@ -29,23 +30,19 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   console.error("FATAL: FIREBASE_SERVICE_ACCOUNT environment variable is not set in Render dashboard.");
 }
 
-// Initialize Firebase Admin for the Mini-Bank
-let db = null;
 try {
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      databaseURL: "https://mudyhub-default-rtdb.firebaseio.com" // Make sure this matches your DB URL
-    });
-    db = admin.database();
-    console.log("✅ Firebase Admin initialized securely.");
-  } else {
-    console.error("❌ FATAL: FIREBASE_SERVICE_ACCOUNT is missing in Render. Mini-Bank will not work.");
-  }
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: "https://mudyhub-default-rtdb.firebaseio.com" // Make sure this is correct
+  });
+  console.log("✅ Firebase Admin initialized securely.");
 } catch (error) {
-  console.error("❌ Failed to initialize Firebase Admin. Check your FIREBASE_SERVICE_ACCOUNT JSON.", error.message);
+  console.error("❌ Failed to initialize Firebase Admin. Check your FIREBASE_SERVICE_ACCOUNT JSON.");
 }
+
+const db = admin.database();
+
 // -----------------------------------------------------
 // MODEL CONFIG
 // -----------------------------------------------------
@@ -156,9 +153,7 @@ async function callGroq({ systemPrompt, messages, model, jsonMode = false, maxTo
 // -----------------------------------------------------
 app.post('/api/generate', async (req, res) => {
   if (!process.env.GROQ_API_KEY) {
-    return res.status(500).json({
-      response: "Server misconfiguration: GROQ_API_KEY is not set."
-    });
+    return res.status(500).json({ response: "Server misconfiguration: GROQ_API_KEY is not set." });
   }
 
   const { prompt, mode, history, thinkMode = false, imageBase64 = null, searchMode = false } = req.body;
@@ -270,7 +265,7 @@ app.get('/api/quiz', async (req, res) => {
 });
 
 // =====================================================
-// SIWES REPORT GENERATOR — NUBAPOLY TEMPLATE
+// SIWES REPORT GENERATOR — NUBAPOLY TEMPLATE (UPDATED)
 // =====================================================
 function blank(v) {
   return (v && typeof v === 'string' && v.trim()) ? v.trim() : "Not provided";
@@ -327,35 +322,31 @@ function getDepartmentReferences(dept) {
   return [itf, nbte, nuc, "Workshop notes, demonstrations, and supervised practical instruction received during the SIWES attachment."];
 }
 
-const STUDENT_VOICE_RULE = `
-CRITICAL WRITING RULE:
-Write like a real Nigerian polytechnic student, not like a textbook or AI.
-- Use SIMPLE, CLEAR sentences. Mix short and medium sentences.
-- Start sentences with "I", "We", "My supervisor", "During my time", "I was shown", "I learned", "I observed", "My main task".
-- Do NOT use academic filler: "furthermore", "moreover", "in conclusion", "it is imperative to note", "the aforementioned", "in essence".
-- Use simple connectors: "Also", "Then", "After that", "Another thing", "The next week", "Later".
-- Occasionally mention small real details like "I noticed", "I asked my supervisor", "My colleague showed me".
-- Write in PAST TENSE.
-- NEVER use markdown symbols like ##, **, ###, or bullet points. Write in flowing paragraphs only.
-- Do NOT start with "Certainly" or "Here is" or "Sure". Start directly with content.
-- USE THE STUDENT'S SPECIFIC ANSWERS IN EVERY PARAGRAPH. Repeat the organisation name and the student's role often.
-- If the student mentions a specific tool, machine, place, or person — USE IT. Do not generalise.
-- The report must NOT look AI-generated. Every paragraph should feel like it came from the student's own memory.
+  const STUDENT_VOICE_RULE = `
+CRITICAL WRITING RULES:
+1. Write like a real Nigerian polytechnic student who paid attention during their attachment, not like a textbook or an AI.
+2. Use SIMPLE, CLEAR sentences. Mix short and medium sentences. Start sentences with "I", "We", "My supervisor", "During my time", "I was shown", "I learned", "I observed".
+3. NEVER use markdown symbols like ##, **, ###, or bullet points. Write in flowing, detailed paragraphs only.
+4. DO NOT HALLUCINATE COMPANY NAMES. You must ONLY use the exact organisation name provided in the context. Never invent names like "ABC Manufacturing" or "Delta Engineering".
+5. AUTOMATIC FILLING: If the student leaves a field empty, YOU MUST INVENT highly realistic, professional details relevant to their department (e.g., if Mechanical, mention lathe machines, micrometers, CNC; if Electrical, mention multimeters, wiring). The report must be 100% complete.
+6. Write in the PAST TENSE.
+7. DO NOT start with "Certainly" or "Here is". Start directly with the content.
+8. You must write extensive, deep, and detailed paragraphs to ensure the final document is between 20 to 25 pages when printed. Do not summarize; elaborate every point.
 `;
 
 function buildChapterPrompts(form) {
   const f = form;
-  const b = blank;
+  // This helper checks if a field is empty and tells the AI to invent it
+  const b = (val) => (val && val.trim() && val !== "Not provided") ? val : "[FIELD EMPTY - YOU MUST INVENT REALISTIC PROFESSIONAL DETAILS]";
 
   return [
     {
       chapterNum: 1,
       title: "CHAPTER ONE: INTRODUCTION TO SIWES",
-      prompt: `Write CHAPTER ONE of a Nigerian SIWES technical report.
-
+      prompt: `Write CHAPTER ONE of a Nigerian SIWES technical report. 
 ${STUDENT_VOICE_RULE}
 
-STRUCTURE — use these exact sub-headings in this order:
+STRUCTURE — use these exact sub-headings, and ensure you write a detailed paragraph after each one:
 a. Definition of SIWES
 b. Brief History of SIWES
 c. Importance / Purpose of SIWES
@@ -369,13 +360,12 @@ Student context:
 - Faculty: ${b(f.faculty)}
 - Level: ${b(f.level)}
 
-Write 1,300–1,500 words. Use real SIWES facts (ITF, established 1973, coordinated with NBTE/NUC/NCCE). Write in flowing paragraphs only. No bullet points. No markdown.`
+Write at least 1,800 words for this chapter. Use real SIWES facts (ITF, 1973, NBTE/NUC/NCCE).`
     },
     {
       chapterNum: 2,
       title: "CHAPTER TWO: " + (form.orgName || "ORGANISATION PROFILE").toUpperCase(),
-      prompt: `Write CHAPTER TWO of a Nigerian SIWES report about the student's host organisation.
-
+      prompt: `Write CHAPTER TWO of a Nigerian SIWES report about the student's host organisation. 
 ${STUDENT_VOICE_RULE}
 
 STRUCTURE — use these exact sub-headings:
@@ -396,104 +386,78 @@ Student context:
 - Student's role: ${b(f.jobRole)}
 - Supervisor: ${b(f.supervisorName)} (${b(f.supervisorPosition)})
 
-Write 1,300–1,500 words. Where the student provided details, USE THEM ALL. Where missing, describe typically but do NOT invent founding dates or CEO names.
-
-Write in paragraphs only. No bullet points. No markdown.`
+Write at least 1,800 words for this chapter. Describe the organisational chart in detail (who reports to who).`
     },
     {
       chapterNum: 3,
       title: "CHAPTER THREE: PRACTICAL EXPERIENCE",
-      prompt: `Write CHAPTER THREE of a Nigerian SIWES report describing the student's actual practical experience.
-
+      prompt: `Write CHAPTER THREE of a Nigerian SIWES report describing the student's actual practical experience. This is the LONGEST chapter.
 ${STUDENT_VOICE_RULE}
 
 STRUCTURE — use these sub-headings:
-a. Experience Acquired in the Organisation
+a. Experience Acquired in the Organisation (Break this down month by month: Month 1, Month 2, Month 3, Month 4)
 b. Summary of Work Undertaken in the Organisation
 
-Student context (USE EVERY DETAIL):
+Student context:
 - Job role: ${b(f.jobRole)}
 - Work hours: ${b(f.workHours)}
 - Daily routine: ${b(f.dailyRoutine)}
-- Team or solo: ${b(f.teamOrSolo)}
-- Month 1: ${b(f.month1)}
-- Month 2: ${b(f.month2)}
-- Month 3: ${b(f.month3)}
-- Month 4: ${b(f.month4)}
 - Tools used: ${b(f.tools)}
 - Trainings: ${b(f.trainings)}
 - Project title: ${b(f.projectTitle)}
 - Project description: ${b(f.projectDesc)}
-- Student's contribution: ${b(f.projectContribution)}
-- Project tools: ${b(f.projectTools)}
-- Project completed: ${b(f.projectCompleted)}
-- Achievement: ${b(f.achievement)}
-- Award: ${b(f.award)}
-- Trained anyone: ${b(f.trainedAnyone)}
+- Project contribution: ${b(f.projectContribution)}
 
-Write 2,000–2,500 words. Section (a) covers month-by-month. Section (b) is a vivid summary. Use the student's real answers everywhere.
-
-Write in paragraphs only. No bullet points. No markdown.`
+Write at least 3,500 words for this chapter. Detail exactly what the student did every single month. Explain how tools like (${b(f.tools)}) were used.`
     },
     {
       chapterNum: 4,
       title: "CHAPTER FOUR: PROBLEMS, CHALLENGES AND SOLUTIONS",
-      prompt: `Write CHAPTER FOUR of a Nigerian SIWES report about problems and solutions.
-
+      prompt: `Write CHAPTER FOUR of a Nigerian SIWES report about problems, challenges, and solutions.
 ${STUDENT_VOICE_RULE}
 
 STRUCTURE:
 a. Problems / Challenges Faced in the Organisation
 b. Solutions to the Problems / Challenges Faced
 
-Student context (USE EVERY DETAIL):
+Student context:
 - Technical challenge 1: ${b(f.challenge1)}
 - Solution 1: ${b(f.challenge1Solution)}
 - Technical challenge 2: ${b(f.challenge2)}
 - Solution 2: ${b(f.challenge2Solution)}
 - Interpersonal challenges: ${b(f.challengeInterpersonal)}
-- Logistics issues: ${b(f.challengeLogistics)}
-- Mistake made: ${b(f.challengeMistake)}
-- Power / internet issues: ${b(f.challengeInfrastructure)}
-- Lessons learned: ${b(f.challengeLessons)}
+- Infrastructure issues: ${b(f.challengeInfrastructure)}
 
-Write 1,300–1,500 words. Elaborate each challenge with the student's real experience.
-
-Write in paragraphs only. No bullet points. No markdown.`
+Write at least 2,000 words. Make the challenges sound real and technical (e.g., power fluctuations, machine breakdown, communication gaps). Explain the solutions step-by-step.`
     },
     {
       chapterNum: 5,
       title: "CHAPTER FIVE: SUMMARY, CONCLUSION AND RECOMMENDATION",
       prompt: `Write CHAPTER FIVE of a Nigerian SIWES report.
-
 ${STUDENT_VOICE_RULE}
 
 STRUCTURE:
 a. Summary
 b. Conclusion
 c. Recommendation
-(Do NOT write References — added separately)
 
 Student context:
 - Technical skills: ${b(f.technicalSkills)}
 - Soft skills: ${b(f.softSkills)}
 - Relevance to course: ${b(f.relevance)}
-- Advice for future students: ${b(f.advice)}
 - Recommendations: ${b(f.recommendations)}
 
-Write 900–1,100 words for sections (a), (b), (c). Then STOP.
-
-Write in paragraphs only. No bullet points. No markdown.`
+Write at least 1,500 words. Ensure the conclusion sounds highly professional. DO NOT write "References" here, we add them separately.`
     }
   ];
 }
 
-async function generateChapter(prompt, maxTokens = 1500) {
+async function generateChapter(prompt, maxTokens = 4000) {
   return callGroq({
-    systemPrompt: `You are an expert Nigerian SIWES report writer. You write reports that read like real students wrote them — using their own words, their own experiences, and their own specific details. You NEVER use markdown symbols. You write ONLY in flowing paragraphs. You start directly with the content.`,
+    systemPrompt: `You are an expert Nigerian SIWES report writer. You write highly detailed, professional, and technical reports that read exactly like a real student wrote them. You NEVER use markdown symbols. You write ONLY in flowing paragraphs.`,
     messages: [{ role: "user", content: prompt }],
     model: MODELS.default,
-    maxTokens,
+    maxTokens: maxTokens,
     temperature: 0.75
   });
 }
@@ -518,12 +482,25 @@ function parseChapter(text) {
   for (const raw of lines) {
     const line = raw.trim();
     if (!line) continue;
+    
+    // Check if it's a subheading
     const isSubheading =
       /^[a-eA-E]\.\s+[A-Z]/.test(line) ||
       /^[a-eA-E]\)\s+/.test(line) ||
       (line.length < 80 && /^(definition|brief history|importance|aim|bodies|mission|vision|organisational chart|experience|summary|problems|solutions|conclusion|recommendation|references)\b/i.test(line));
-    if (isSubheading) out.push({ type: "subheading", text: line });
-    else out.push({ type: "paragraph", text: line });
+      
+    if (isSubheading) {
+      out.push({ type: "subheading", text: line });
+    } else {
+      // Handle merged heading and text (e.g., "a. Definition of SIWESI first heard...")
+      const mergedHeadingMatch = line.match(/^([a-eA-E]\.\s*[A-Za-z\s]{3,35})(.*)$/);
+      if (mergedHeadingMatch) {
+        out.push({ type: "subheading", text: mergedHeadingMatch[1].trim() });
+        out.push({ type: "paragraph", text: mergedHeadingMatch[2].trim() });
+      } else {
+        out.push({ type: "paragraph", text: line });
+      }
+    }
   }
   return out;
 }
@@ -569,8 +546,9 @@ function docxSubheading(text) {
   });
 }
 
+// ✅ FIXED: Hard page breaks
 function docxPageBreak() {
-  return new Paragraph({ children: [new TextRun({ text: "", break: 1 })] });
+  return new Paragraph({ children: [new PageBreak()] });
 }
 
 // -----------------------------------------------------
@@ -592,7 +570,11 @@ app.post('/api/siwes', async (req, res) => {
 
     for (const p of prompts) {
       console.log(`[SIWES] Generating ${p.title}...`);
-      const raw = await generateChapter(p.prompt, 1500); // Max 1500 tokens per chapter
+      
+      // Increase tokens for Chapter 3 (Practical Experience) as it's the longest
+      const maxTokensForChapter = p.chapterNum === 3 ? 4000 : 2500; 
+      const raw = await generateChapter(p.prompt, maxTokensForChapter); 
+      
       chapters.push({ num: p.chapterNum, title: p.title, text: stripMarkdown(raw) });
 
       // Wait 15 seconds before the next chapter to avoid rate limit
@@ -747,7 +729,7 @@ app.post('/api/siwes', async (req, res) => {
     children.push(docxHeading("ABSTRACT", 1));
     children.push(docxPara(""));
     children.push(docxPara(
-      `This report presents a detailed account of the Student Industrial Work Experience Scheme (SIWES) attachment undertaken by ${formData.fullName || "the student"} at ${formData.orgName || "an organisation"} from ${formData.startDate || ""} to ${formData.endDate || ""}, as part of the ${formData.level || "ND II"} ${formData.dept || "programme"} at ${formData.institution || "Nuhu Bamalli Polytechnic, Zaria"}. During the attachment, the student worked in the ${formData.orgUnit || "relevant"} unit as a ${formData.jobRole || "student intern"}. The report covers the organisation's profile, the practical experience acquired, the projects handled, the technical and interpersonal challenges encountered, and the lessons learned. The SIWES programme provided invaluable practical exposure that complemented the theoretical knowledge gained in the classroom and significantly enhanced the student's technical and soft skills.`
+      `\nThis report presents a detailed account of the Student Industrial Work Experience Scheme (SIWES) attachment undertaken by ${formData.fullName || "the student"} at ${formData.orgName || "an organisation"} from ${formData.startDate || ""} to ${formData.endDate || ""}, as part of the ${formData.level || "ND II"} ${formData.dept || "programme"} at ${formData.institution || "Nuhu Bamalli Polytechnic, Zaria"}. During the attachment, the student worked in the ${formData.orgUnit || "relevant"} unit as a ${formData.jobRole || "student intern"}. The report covers the organisation's profile, the practical experience acquired, the projects handled, the technical and interpersonal challenges encountered, and the lessons learned. The SIWES programme provided invaluable practical exposure that complemented the theoretical knowledge gained in the classroom and significantly enhanced the student's technical and soft skills.`
     ));
     children.push(docxPageBreak());
 
@@ -820,6 +802,24 @@ app.post('/api/siwes', async (req, res) => {
             margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 }
           }
         },
+        // ✅ ADDED: Page Numbers in Footer
+        footers: {
+          default: new Footer({
+            children: [
+              new Paragraph({
+                alignment: AlignmentType.CENTER,
+                children: [
+                  new TextRun({
+                    children: ["Page ", PageNumber.CURRENT],
+                    font: "Times New Roman",
+                    size: 24, 
+                    color: "666666" 
+                  }),
+                ],
+              }),
+            ],
+          }),
+        },
         children
       }]
     });
@@ -837,12 +837,11 @@ app.post('/api/siwes', async (req, res) => {
   }
 });
 
-
 // =====================================================================
-// 🚨 NEW: MINI-BANK ROUTES (SECURE MONEY HANDLING)
+// MINI-BANK ROUTES (SECURE MONEY HANDLING)
 // =====================================================================
 
-       // --- A. SECURE TOP-UP (Paystack) ---
+// --- A. SECURE TOP-UP (Paystack) ---
 app.post("/api/verify-topup", async (req, res) => {
   try {
     const idToken = req.headers.authorization?.split("Bearer ")[1];
