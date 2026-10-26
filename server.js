@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
 import admin from 'firebase-admin';
@@ -900,19 +901,41 @@ app.post("/api/verify-topup", async (req, res) => {
   }
 });
 
-// --- B. SECURE WITHDRAWAL (Direct to Bank) ---
+// --- B. SECURE WITHDRAWAL (Direct to Bank with PIN Verification) ---
 app.post("/api/withdraw", async (req, res) => {
   try {
     const idToken = req.headers.authorization?.split("Bearer ")[1];
     if (!idToken) return res.status(401).json({ error: "Unauthorized" });
+    
     const decodedToken = await admin.auth().verifyIdToken(idToken);
     const userId = decodedToken.uid;
 
-    const { amount, bankCode, accountNumber, accountName } = req.body;
+    // 1. Extract PIN from request body
+    const { amount, bankCode, accountNumber, accountName, pin } = req.body;
     const withdrawAmount = Number(amount);
 
-    if (withdrawAmount < 1000) return res.status(400).json({ error: "Minimum is ₦1000" });
+    // 2. Validate Basic Inputs
+    if (withdrawAmount < 1000) {
+      return res.status(400).json({ error: "Minimum withdrawal is ₦1,000" });
+    }
+    if (!pin || pin.length !== 4) {
+      return res.status(400).json({ error: "Valid 4-digit Wallet PIN is required." });
+    }
 
+    // 3. Verify User PIN against Database Hash
+    const userSnap = await db.ref(`users/${userId}`).once("value");
+    const userData = userSnap.val();
+
+    if (!userData || !userData.pinHash) {
+      return res.status(400).json({ error: "No wallet PIN set. Please set one in Settings." });
+    }
+
+    const enteredPinHash = crypto.createHash('sha256').update(pin).digest('hex');
+    if (enteredPinHash !== userData.pinHash) {
+      return res.status(401).json({ error: "Incorrect Wallet PIN." });
+    }
+
+    // 4. Check Balance
     const walletRef = db.ref(`users/${userId}/walletBalance`);
     const walletSnap = await walletRef.once("value");
     const currentBalance = walletSnap.val() || 0;
@@ -921,13 +944,17 @@ app.post("/api/withdraw", async (req, res) => {
       return res.status(400).json({ error: "Insufficient funds" });
     }
 
-    // Deduct wallet
-    await walletRef.transaction((current) => {
+    // 5. Deduct wallet atomically (Lock funds)
+    const deductResult = await walletRef.transaction((current) => {
         if (current >= withdrawAmount) return current - withdrawAmount;
-        return current;
+        return current; // Abort if balance is somehow lower
     });
 
-    // Create Paystack Recipient
+    if (!deductResult.committed) {
+        return res.status(400).json({ error: "Transaction failed. Insufficient funds." });
+    }
+
+    // 6. Create Paystack Recipient
     const recipientRes = await fetch("https://api.paystack.co/transferrecipient", {
       method: "POST",
       headers: {
@@ -945,12 +972,12 @@ app.post("/api/withdraw", async (req, res) => {
     const recipientData = await recipientRes.json();
 
     if (!recipientData.status) {
-        // Refund if recipient fails
+        // REFUND if recipient creation fails
         await walletRef.transaction((current) => (current || 0) + withdrawAmount);
-        return res.status(400).json({ error: "Invalid bank details" });
+        return res.status(400).json({ error: recipientData.message || "Invalid bank details" });
     }
 
-    // Initiate Transfer
+    // 7. Initiate Transfer via Paystack
     const transferRes = await fetch("https://api.paystack.co/transfer", {
       method: "POST",
       headers: {
@@ -959,7 +986,7 @@ app.post("/api/withdraw", async (req, res) => {
       },
       body: JSON.stringify({
         source: "balance",
-        amount: withdrawAmount * 100,
+        amount: withdrawAmount * 100, // Convert to Kobo
         recipient: recipientData.data.recipient_code,
         reason: "MudyHub Withdrawal"
       })
@@ -967,21 +994,30 @@ app.post("/api/withdraw", async (req, res) => {
     const transferData = await transferRes.json();
 
     if (!transferData.status) {
-        // Refund if transfer fails
+        // REFUND if transfer fails
         await walletRef.transaction((current) => (current || 0) + withdrawAmount);
-        return res.status(400).json({ error: "Transfer failed. Funds returned." });
+        return res.status(400).json({ error: transferData.message || "Transfer failed. Funds returned." });
     }
 
-    // Log the withdrawal
+    // 8. Log the withdrawal securely
     await db.ref(`withdrawalRequests`).push({
       uid: userId,
       amount: withdrawAmount,
       bankCode,
       accountNumber,
       accountName,
-      status: "processing",
+      status: "processing", // Paystack webhooks will update this to "completed" later
       paystackRef: transferData.data.reference,
       createdAt: admin.database.ServerValue.TIMESTAMP
+    });
+
+    // 9. Notify User
+    await db.ref(`notifications/${userId}`).push({
+        type: "withdrawal",
+        amount: withdrawAmount,
+        message: `Payout of ₦${withdrawAmount.toLocaleString()} is on its way to your bank.`,
+        createdAt: admin.database.ServerValue.TIMESTAMP,
+        read: false
     });
 
     return res.status(200).json({ message: "Withdrawal processing", reference: transferData.data.reference });
