@@ -977,50 +977,107 @@ app.post("/api/withdraw", async (req, res) => {
         return res.status(400).json({ error: recipientData.message || "Invalid bank details" });
     }
 
-    // 7. Initiate Transfer via Paystack
-    const transferRes = await fetch("https://api.paystack.co/transfer", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        source: "balance",
-        amount: withdrawAmount * 100, // Convert to Kobo
-        recipient: recipientData.data.recipient_code,
-        reason: "MudyHub Withdrawal"
-      })
-    });
-    const transferData = await transferRes.json();
+// --- B. SECURE WITHDRAWAL (Manual Admin Approval with PIN Verification) ---
+app.post("/api/withdraw", async (req, res) => {
+  try {
+    const idToken = req.headers.authorization?.split("Bearer ")[1];
+    if (!idToken) return res.status(401).json({ error: "Unauthorized" });
+    
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const userId = decodedToken.uid;
 
-    if (!transferData.status) {
-        // REFUND if transfer fails
-        await walletRef.transaction((current) => (current || 0) + withdrawAmount);
-        return res.status(400).json({ error: transferData.message || "Transfer failed. Funds returned." });
+    // 1. Extract inputs
+    const { amount, bankCode, bankName, accountNumber, accountName, pin } = req.body;
+    const withdrawAmount = Math.floor(Number(amount));
+
+    // 2. Validate inputs
+    if (!withdrawAmount || withdrawAmount < 1000) {
+      return res.status(400).json({ error: "Minimum withdrawal is ₦1,000" });
+    }
+    if (withdrawAmount > 500000) {
+      return res.status(400).json({ error: "Maximum single withdrawal is ₦500,000" });
+    }
+    if (!pin || !/^\d{4}$/.test(pin)) {
+      return res.status(400).json({ error: "Valid 4-digit PIN required." });
+    }
+    if (!bankCode || !bankName) {
+      return res.status(400).json({ error: "Select a bank." });
+    }
+    if (!/^\d{10}$/.test(accountNumber)) {
+      return res.status(400).json({ error: "Account number must be 10 digits." });
+    }
+    if (!accountName || accountName.trim().length < 3) {
+      return res.status(400).json({ error: "Enter account holder name." });
     }
 
-    // 8. Log the withdrawal securely
-    await db.ref(`withdrawalRequests`).push({
+    // 3. Load user + BAN CHECK
+    const userSnap = await db.ref(`users/${userId}`).once("value");
+    const userData = userSnap.val();
+    if (!userData) return res.status(404).json({ error: "User not found." });
+    if (userData.banned === true) {
+      return res.status(403).json({ error: "Your account is suspended. Contact support." });
+    }
+    if (!userData.pinHash) {
+      return res.status(400).json({ error: "No wallet PIN set. Please set one in Settings." });
+    }
+
+    // 4. Verify PIN
+    const enteredPinHash = crypto.createHash('sha256').update(pin).digest('hex');
+    if (enteredPinHash !== userData.pinHash) {
+      return res.status(401).json({ error: "Incorrect Wallet PIN." });
+    }
+
+    // 5. Snapshot balance (audit + early reject)
+    const walletRef = db.ref(`users/${userId}/walletBalance`);
+    const walletSnap = await walletRef.once("value");
+    const balanceBefore = Number(walletSnap.val() || 0);
+    if (balanceBefore < withdrawAmount) {
+      return res.status(400).json({ error: "Insufficient wallet balance." });
+    }
+
+    // 6. ATOMIC DEDUCTION (FIXED: return undefined aborts, return current didn't)
+    const deductResult = await walletRef.transaction((current) => {
+      const balance = Number(current || 0);
+      if (balance < withdrawAmount) return; // <-- ABORT (was returning current = silent bug)
+      return balance - withdrawAmount;
+    });
+
+    if (!deductResult.committed) {
+      return res.status(400).json({ error: "Insufficient wallet balance." });
+    }
+    const newBalance = deductResult.snapshot.val();
+
+    // 7. Create pending request — NO Paystack call, admin handles manually
+    const requestRef = db.ref("withdrawalRequests").push();
+    await requestRef.set({
+      id: requestRef.key,
       uid: userId,
       amount: withdrawAmount,
-      bankCode,
-      accountNumber,
-      accountName,
-      status: "processing", // Paystack webhooks will update this to "completed" later
-      paystackRef: transferData.data.reference,
-      createdAt: admin.database.ServerValue.TIMESTAMP
+      balanceBefore: balanceBefore,
+      bank: bankName,          // legacy alias used by admin.js
+      bankName: bankName,
+      bankCode: bankCode,
+      accountNumber: accountNumber,
+      accountName: accountName,
+      status: "pending",
+      createdAt: admin.database.ServerValue.TIMESTAMP,
     });
 
-    // 9. Notify User
+    // 8. Notify user
     await db.ref(`notifications/${userId}`).push({
-        type: "withdrawal",
-        amount: withdrawAmount,
-        message: `Payout of ₦${withdrawAmount.toLocaleString()} is on its way to your bank.`,
-        createdAt: admin.database.ServerValue.TIMESTAMP,
-        read: false
+      type: "withdrawal_requested",
+      amount: withdrawAmount,
+      message: `Withdrawal request of ₦${withdrawAmount.toLocaleString()} submitted for admin review.`,
+      createdAt: admin.database.ServerValue.TIMESTAMP,
+      read: false,
     });
 
-    return res.status(200).json({ message: "Withdrawal processing", reference: transferData.data.reference });
+    return res.status(200).json({
+      success: true,
+      requestId: requestRef.key,
+      newBalance: newBalance,
+      message: "Withdrawal request submitted. Admin will review shortly.",
+    });
 
   } catch (error) {
     console.error("Withdraw Error:", error);
