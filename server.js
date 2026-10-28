@@ -268,9 +268,6 @@ app.get('/api/quiz', async (req, res) => {
 // =====================================================
 // SIWES REPORT GENERATOR — NUBAPOLY TEMPLATE (UPDATED)
 // =====================================================
-function blank(v) {
-  return (v && typeof v === 'string' && v.trim()) ? v.trim() : "Not provided";
-}
 
 function getDepartmentReferences(dept) {
   const d = (dept || "").toLowerCase();
@@ -290,7 +287,8 @@ function getDepartmentReferences(dept) {
     "Bakshi, U. A., & Bakshi, M. V. (2017). Electrical Machines. Technical Publications.",
     itf, nbte, nuc
   ];
-  if (d.includes("computer") || d.includes("software") || d.includes("it ")) return [
+  // 🚨 FIXED: Added "it" and "information" to catch IT students properly
+  if (d.includes("computer") || d.includes("software") || d.includes("it") || d.includes("information")) return [
     "Silberschatz, A., Galvin, P. B., & Gagne, G. (2018). Operating System Concepts. Wiley.",
     "Tanenbaum, A. S., & Wetherall, D. J. (2019). Computer Networks. Pearson.",
     "Sommerville, I. (2016). Software Engineering. Pearson.",
@@ -323,22 +321,27 @@ function getDepartmentReferences(dept) {
   return [itf, nbte, nuc, "Workshop notes, demonstrations, and supervised practical instruction received during the SIWES attachment."];
 }
 
-  const STUDENT_VOICE_RULE = `
+const STUDENT_VOICE_RULE = `
 CRITICAL WRITING RULES:
 1. Write like a real Nigerian polytechnic student who paid attention during their attachment, not like a textbook or an AI.
 2. Use SIMPLE, CLEAR sentences. Mix short and medium sentences. Start sentences with "I", "We", "My supervisor", "During my time", "I was shown", "I learned", "I observed".
-3. NEVER use markdown symbols like ##, **, ###, or bullet points. Write in flowing, detailed paragraphs only.
+3. FORMATTING: You may use **bold** for key terms or sub-headings. You may use dashes (-) for lists. NEVER use hashtags (#), asterisks for headers (***), or code blocks.
 4. DO NOT HALLUCINATE COMPANY NAMES. You must ONLY use the exact organisation name provided in the context. Never invent names like "ABC Manufacturing" or "Delta Engineering".
 5. AUTOMATIC FILLING: If the student leaves a field empty, YOU MUST INVENT highly realistic, professional details relevant to their department (e.g., if Mechanical, mention lathe machines, micrometers, CNC; if Electrical, mention multimeters, wiring). The report must be 100% complete.
 6. Write in the PAST TENSE.
 7. DO NOT start with "Certainly" or "Here is". Start directly with the content.
-8. You must write extensive, deep, and detailed paragraphs to ensure the final document is between 20 to 25 pages when printed. Do not summarize; elaborate every point.
+8. You must write detailed paragraphs to ensure the final document is between 20 to 25 pages when printed. Do not write excessively long chapters; follow the word count instructions exactly.
 `;
 
 function buildChapterPrompts(form) {
   const f = form;
-  // This helper checks if a field is empty and tells the AI to invent it
-  const b = (val) => (val && val.trim() && val !== "Not provided") ? val : "[FIELD EMPTY - YOU MUST INVENT REALISTIC PROFESSIONAL DETAILS]";
+  const dept = (f.dept || "General").toLowerCase();
+
+  // 🚨 SMART AUTO-FILL LOGIC
+  const b = (val, emptyInstruction) => {
+    if (val && val.trim() && val !== "Not provided" && val !== "undefined") return val;
+    return `[FIELD EMPTY - INVENT REALISTIC PROFESSIONAL DETAILS: ${emptyInstruction}]`;
+  };
 
   return [
     {
@@ -355,13 +358,13 @@ d. Aim and Objectives of SIWES
 e. Bodies Involved in the Management of SIWES and Their Roles
 
 Student context:
-- Name: ${b(f.fullName)}
-- Institution: ${b(f.institution)}
-- Department: ${b(f.dept)}
-- Faculty: ${b(f.faculty)}
-- Level: ${b(f.level)}
+- Name: ${b(f.fullName, "Use 'The Student'")}
+- Institution: ${b(f.institution, "Use 'Nuhu Bamalli Polytechnic'")}
+- Department: ${b(f.dept, "Use 'Engineering'")}
+- Faculty: ${b(f.faculty, "Use 'School of Engineering'")}
+- Level: ${b(f.level, "Use 'ND II'")}
 
-Write at least 1,800 words for this chapter. Use real SIWES facts (ITF, 1973, NBTE/NUC/NCCE).`
+Write exactly 900 words for this chapter. Use real SIWES facts (ITF, 1973, NBTE/NUC/NCCE).`
     },
     {
       chapterNum: 2,
@@ -377,22 +380,22 @@ d. Organisational Chart
 e. Roles Performed by the Organisation
 
 Student context:
-- Organisation: ${b(f.orgName)}
-- Address: ${b(f.orgAddress)}
-- Sector: ${b(f.orgSector)}
-- History provided: ${b(f.orgHistory)}
-- Mission provided: ${b(f.orgMission)}
-- Vision provided: ${b(f.orgVision)}
-- Student's unit: ${b(f.orgUnit)}
-- Student's role: ${b(f.jobRole)}
-- Supervisor: ${b(f.supervisorName)} (${b(f.supervisorPosition)})
+- Organisation: ${b(f.orgName, "INVENT a realistic company name")}
+- Address: ${b(f.orgAddress, "INVENT a realistic Nigerian street address")}
+- Sector: ${b(f.orgSector, "INVENT a sector relevant to the department")}
+- History provided: ${b(f.orgHistory, "WRITE a realistic 1-paragraph history")}
+- Mission provided: ${b(f.orgMission, "WRITE a professional corporate mission")}
+- Vision provided: ${b(f.orgVision, "WRITE a professional corporate vision")}
+- Student's unit: ${b(f.orgUnit, "INVENT a relevant department")}
+- Student's role: ${b(f.jobRole, "INVENT a realistic intern job title")}
+- Supervisor: ${b(f.supervisorName, "INVENT a Nigerian name")} (${b(f.supervisorPosition, "INVENT a job title")})
 
-Write at least 1,800 words for this chapter. Describe the organisational chart in detail (who reports to who).`
+Write exactly 1,000 words for this chapter. Describe the organisational chart briefly.`
     },
     {
       chapterNum: 3,
       title: "CHAPTER THREE: PRACTICAL EXPERIENCE",
-      prompt: `Write CHAPTER THREE of a Nigerian SIWES report describing the student's actual practical experience. This is the LONGEST chapter.
+      prompt: `Write CHAPTER THREE of a Nigerian SIWES report describing the student's actual practical experience.
 ${STUDENT_VOICE_RULE}
 
 STRUCTURE — use these sub-headings:
@@ -400,16 +403,21 @@ a. Experience Acquired in the Organisation (Break this down month by month: Mont
 b. Summary of Work Undertaken in the Organisation
 
 Student context:
-- Job role: ${b(f.jobRole)}
-- Work hours: ${b(f.workHours)}
-- Daily routine: ${b(f.dailyRoutine)}
-- Tools used: ${b(f.tools)}
-- Trainings: ${b(f.trainings)}
-- Project title: ${b(f.projectTitle)}
-- Project description: ${b(f.projectDesc)}
-- Project contribution: ${b(f.projectContribution)}
+- Job role: ${b(f.jobRole, "INVENT a relevant intern role")}
+- Work hours: ${b(f.workHours, "Assume 8:00 AM to 4:00 PM, Monday to Friday")}
+- Daily routine: ${b(f.dailyRoutine, "INVENT a realistic daily routine")}
+- Tools used: ${b(f.tools, `INVENT specific tools or software relevant to ${dept} (e.g., VS Code for CS, lathe machines for Mech)`)}
+- Trainings: ${b(f.trainings, "INVENT a realistic workplace training")}
+- Project title: ${b(f.projectTitle, "INVENT a realistic project title")}
+- Project description: ${b(f.projectDesc, "INVENT a detailed description")}
+- Project contribution: ${b(f.projectContribution, "INVENT what the student did")}
+- Project tools: ${b(f.projectTools, "INVENT tools used for the project")}
+- Month 1: ${b(f.month1, "Describe general orientation")}
+- Month 2: ${b(f.month2, "Describe assisting senior staff")}
+- Month 3: ${b(f.month3, "Describe working independently")}
+- Month 4: ${b(f.month4, "Describe final project completion")}
 
-Write at least 3,500 words for this chapter. Detail exactly what the student did every single month. Explain how tools like (${b(f.tools)}) were used.`
+Write exactly 1,800 words for this chapter. Detail exactly what the student did every single month.`
     },
     {
       chapterNum: 4,
@@ -422,14 +430,15 @@ a. Problems / Challenges Faced in the Organisation
 b. Solutions to the Problems / Challenges Faced
 
 Student context:
-- Technical challenge 1: ${b(f.challenge1)}
-- Solution 1: ${b(f.challenge1Solution)}
-- Technical challenge 2: ${b(f.challenge2)}
-- Solution 2: ${b(f.challenge2Solution)}
-- Interpersonal challenges: ${b(f.challengeInterpersonal)}
-- Infrastructure issues: ${b(f.challengeInfrastructure)}
+- Technical challenge 1: ${b(f.challenge1, "INVENT a realistic technical challenge")}
+- Solution 1: ${b(f.challenge1Solution, "INVENT a realistic solution")}
+- Technical challenge 2: ${b(f.challenge2, "INVENT a second technical challenge")}
+- Solution 2: ${b(f.challenge2Solution, "INVENT a realistic solution")}
+- Interpersonal challenges: ${b(f.challengeInterpersonal, "INVENT a teamwork issue")}
+- Infrastructure issues: ${b(f.challengeInfrastructure, "INVENT a Nigerian infrastructure issue")}
+- Lessons learned: ${b(f.challengeLessons, "Summarize key lessons")}
 
-Write at least 2,000 words. Make the challenges sound real and technical (e.g., power fluctuations, machine breakdown, communication gaps). Explain the solutions step-by-step.`
+Write exactly 900 words. Make the challenges sound real and technical.`
     },
     {
       chapterNum: 5,
@@ -443,19 +452,20 @@ b. Conclusion
 c. Recommendation
 
 Student context:
-- Technical skills: ${b(f.technicalSkills)}
-- Soft skills: ${b(f.softSkills)}
-- Relevance to course: ${b(f.relevance)}
-- Recommendations: ${b(f.recommendations)}
+- Technical skills: ${b(f.technicalSkills, "INVENT technical skills acquired")}
+- Soft skills: ${b(f.softSkills, "INVENT soft skills acquired")}
+- Relevance to course: ${b(f.relevance, "Explain how SIWES relates to the course")}
+- Recommendations: ${b(f.recommendations, "INVENT 3 recommendations")}
+- Advice: ${b(f.advice, "INVENT advice for future students")}
 
-Write at least 1,500 words. Ensure the conclusion sounds highly professional. DO NOT write "References" here, we add them separately.`
+Write exactly 700 words. Ensure the conclusion sounds highly professional.`
     }
   ];
 }
 
 async function generateChapter(prompt, maxTokens = 4000) {
   return callGroq({
-    systemPrompt: `You are an expert Nigerian SIWES report writer. You write highly detailed, professional, and technical reports that read exactly like a real student wrote them. You NEVER use markdown symbols. You write ONLY in flowing paragraphs.`,
+    systemPrompt: `You are an expert Nigerian SIWES report writer. You write highly detailed, professional, and technical reports that read exactly like a real student wrote them. You follow the formatting rules strictly.`,
     messages: [{ role: "user", content: prompt }],
     model: MODELS.default,
     maxTokens: maxTokens,
@@ -466,12 +476,11 @@ async function generateChapter(prompt, maxTokens = 4000) {
 function stripMarkdown(text) {
   if (!text) return "";
   let c = text;
+  // Remove hashtags and code blocks (we KEEP ** and - for the docx builder)
   c = c.replace(/^#{1,6}\s+/gm, "");
-  c = c.replace(/\*\*(.+?)\*\*/g, "$1");
-  c = c.replace(/\*(.+?)\*/g, "$1");
+  c = c.replace(/```[\s\S]*?```/g, "");
   c = c.replace(/`([^`]+)`/g, "$1");
-  c = c.replace(/^[-*•]\s+/gm, "");
-  c = c.replace(/^\s*\d+\.\s+/gm, "");
+  c = c.replace(/^>\s+/gm, "");
   c = c.replace(/\n{3,}/g, "\n\n");
   return c.trim();
 }
@@ -480,23 +489,30 @@ function parseChapter(text) {
   const out = [];
   const cleaned = stripMarkdown(text);
   const lines = cleaned.split(/\r?\n/);
+  
   for (const raw of lines) {
     const line = raw.trim();
     if (!line) continue;
     
-    // Check if it's a subheading
+    // 1. Detect Bullet Points (starts with - or *)
+    if (/^[-*+•]\s+/.test(line)) {
+      out.push({ type: "bullet", text: line.replace(/^[-*+•]\s+/, "") });
+      continue;
+    }
+
+    // 2. Detect Subheadings
     const isSubheading =
       /^[a-eA-E]\.\s+[A-Z]/.test(line) ||
       /^[a-eA-E]\)\s+/.test(line) ||
       (line.length < 80 && /^(definition|brief history|importance|aim|bodies|mission|vision|organisational chart|experience|summary|problems|solutions|conclusion|recommendation|references)\b/i.test(line));
       
     if (isSubheading) {
-      out.push({ type: "subheading", text: line });
+      out.push({ type: "subheading", text: line.replace(/\*\*/g, "") }); // Strip bold from headings
     } else {
-      // Handle merged heading and text (e.g., "a. Definition of SIWESI first heard...")
+      // Handle merged heading and text
       const mergedHeadingMatch = line.match(/^([a-eA-E]\.\s*[A-Za-z\s]{3,35})(.*)$/);
-      if (mergedHeadingMatch) {
-        out.push({ type: "subheading", text: mergedHeadingMatch[1].trim() });
+      if (mergedHeadingMatch && mergedHeadingMatch[2].trim().length > 0) {
+        out.push({ type: "subheading", text: mergedHeadingMatch[1].replace(/\*\*/g, "").trim() });
         out.push({ type: "paragraph", text: mergedHeadingMatch[2].trim() });
       } else {
         out.push({ type: "paragraph", text: line });
@@ -511,17 +527,33 @@ function dataUriToBuffer(dataUri) {
   return Buffer.from(base64, "base64");
 }
 
+// 🚨 FIXED: Handles bold text (**) natively inside Word
 function docxPara(text, opts = {}) {
-  return new Paragraph({
-    alignment: opts.center ? AlignmentType.CENTER : (opts.right ? AlignmentType.RIGHT : AlignmentType.JUSTIFIED),
-    spacing: { after: opts.afterSpacing ?? 160, line: 360 },
-    children: [new TextRun({
-      text: text,
+  const parts = String(text || "").split(/(\*\*.*?\*\*)/g);
+  
+  const children = parts.map(part => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return new TextRun({
+        text: part.slice(2, -2),
+        bold: true,
+        italics: !!opts.italic,
+        size: opts.size || 24,
+        font: "Times New Roman"
+      });
+    }
+    return new TextRun({
+      text: part,
       bold: !!opts.bold,
       italics: !!opts.italic,
       size: opts.size || 24,
       font: "Times New Roman"
-    })]
+    });
+  });
+
+  return new Paragraph({
+    alignment: opts.center ? AlignmentType.CENTER : (opts.right ? AlignmentType.RIGHT : AlignmentType.JUSTIFIED),
+    spacing: { after: opts.afterSpacing ?? 160, line: 360 },
+    children: children
   });
 }
 
@@ -547,14 +579,14 @@ function docxSubheading(text) {
   });
 }
 
-// ✅ FIXED: Hard page breaks
 function docxPageBreak() {
   return new Paragraph({ children: [new PageBreak()] });
-}
+    }
 
 // -----------------------------------------------------
 // /api/siwes
 // -----------------------------------------------------
+                            
 app.post('/api/siwes', async (req, res) => {
   if (!process.env.GROQ_API_KEY) {
     return res.status(500).json({ error: "GROQ_API_KEY not set on server." });
@@ -562,6 +594,14 @@ app.post('/api/siwes', async (req, res) => {
 
   const { uid, formData, images } = req.body;
   if (!uid || !formData) return res.status(400).json({ error: "Missing uid or formData." });
+
+  // 🚨 MANDATORY FIELD VALIDATION (Prevents wasted AI calls and protects the user)
+  const requiredFields = ['fullName', 'matric', 'dept', 'institution', 'orgName', 'startDate', 'endDate'];
+  for (const field of requiredFields) {
+    if (!formData[field] || String(formData[field]).trim() === "") {
+      return res.status(400).json({ error: `Missing required field: ${field}. Please go back and fill it in.` });
+    }
+  }
 
   try {
     console.log(`[SIWES] Starting for uid=${uid}, org=${formData.orgName}, dept=${formData.dept}`);
@@ -572,16 +612,16 @@ app.post('/api/siwes', async (req, res) => {
     for (const p of prompts) {
       console.log(`[SIWES] Generating ${p.title}...`);
       
-      // Increase tokens for Chapter 3 (Practical Experience) as it's the longest
-      const maxTokensForChapter = p.chapterNum === 3 ? 4000 : 2500; 
+      // 🚨 FIXED: 20-25 Page Token Limits
+      const maxTokensForChapter = p.chapterNum === 3 ? 3500 : 2000; 
       const raw = await generateChapter(p.prompt, maxTokensForChapter); 
       
       chapters.push({ num: p.chapterNum, title: p.title, text: stripMarkdown(raw) });
 
-      // Wait 15 seconds before the next chapter to avoid rate limit
+      // Wait 10 seconds before the next chapter to avoid rate limit
       if (p.chapterNum < 5) {
-        console.log(`[SIWES] Waiting 15s to avoid rate limit...`);
-        await new Promise(r => setTimeout(r, 15000));
+        console.log(`[SIWES] Waiting 10s to avoid rate limit...`);
+        await new Promise(r => setTimeout(r, 10000));
       }
     }
 
@@ -755,9 +795,10 @@ app.post('/api/siwes', async (req, res) => {
           let figN = 1;
           for (const img of workImgs) {
             try {
+              // 🚨 FIXED: Aspect ratio changed to 450x320
               children.push(new Paragraph({
                 alignment: AlignmentType.CENTER,
-                children: [new ImageRun({ data: dataUriToBuffer(img.data), transformation: { width: 400, height: 300 } })]
+                children: [new ImageRun({ data: dataUriToBuffer(img.data), transformation: { width: 450, height: 320 } })]
               }));
               children.push(docxPara(`Figure 3.${figN}: Author on duty at ${formData.orgName || "the organisation"}`, { center: true, italic: true, size: 20 }));
               figN++;
@@ -766,9 +807,10 @@ app.post('/api/siwes', async (req, res) => {
           const projImgs = [images.project1, images.project2].filter(i => i?.data);
           for (const img of projImgs) {
             try {
+              // 🚨 FIXED: Aspect ratio changed to 450x320
               children.push(new Paragraph({
                 alignment: AlignmentType.CENTER,
-                children: [new ImageRun({ data: dataUriToBuffer(img.data), transformation: { width: 400, height: 300 } })]
+                children: [new ImageRun({ data: dataUriToBuffer(img.data), transformation: { width: 450, height: 320 } })]
               }));
               children.push(docxPara(`Figure 3.${figN}: ${formData.projectTitle || "Project work"}`, { center: true, italic: true, size: 20 }));
               figN++;
@@ -779,8 +821,19 @@ app.post('/api/siwes', async (req, res) => {
 
       const parsed = parseChapter(ch.text);
       for (const item of parsed) {
-        if (item.type === "subheading") children.push(docxSubheading(item.text));
-        else children.push(docxPara(item.text));
+        if (item.type === "subheading") {
+          children.push(docxSubheading(item.text));
+        } else if (item.type === "bullet") {
+          // 🚨 FIXED: Renders real Word bullet points
+          children.push(new Paragraph({
+            text: item.text,
+            bullet: { level: 0 },
+            spacing: { after: 120, line: 360 },
+            style: "Normal"
+          }));
+        } else {
+          children.push(docxPara(item.text));
+        }
       }
 
       if (ch.num === 5) {
