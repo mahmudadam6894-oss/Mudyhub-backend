@@ -953,83 +953,6 @@ app.post("/api/verify-topup", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
-
-// --- B. SECURE WITHDRAWAL (Direct to Bank with PIN Verification) ---
-app.post("/api/withdraw", async (req, res) => {
-  try {
-    const idToken = req.headers.authorization?.split("Bearer ")[1];
-    if (!idToken) return res.status(401).json({ error: "Unauthorized" });
-    
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    const userId = decodedToken.uid;
-
-    // 1. Extract PIN from request body
-    const { amount, bankCode, accountNumber, accountName, pin } = req.body;
-    const withdrawAmount = Number(amount);
-
-    // 2. Validate Basic Inputs
-    if (withdrawAmount < 1000) {
-      return res.status(400).json({ error: "Minimum withdrawal is ₦1,000" });
-    }
-    if (!pin || pin.length !== 4) {
-      return res.status(400).json({ error: "Valid 4-digit Wallet PIN is required." });
-    }
-
-    // 3. Verify User PIN against Database Hash
-    const userSnap = await db.ref(`users/${userId}`).once("value");
-    const userData = userSnap.val();
-
-    if (!userData || !userData.pinHash) {
-      return res.status(400).json({ error: "No wallet PIN set. Please set one in Settings." });
-    }
-
-    const enteredPinHash = crypto.createHash('sha256').update(pin).digest('hex');
-    if (enteredPinHash !== userData.pinHash) {
-      return res.status(401).json({ error: "Incorrect Wallet PIN." });
-    }
-
-    // 4. Check Balance
-    const walletRef = db.ref(`users/${userId}/walletBalance`);
-    const walletSnap = await walletRef.once("value");
-    const currentBalance = walletSnap.val() || 0;
-    
-    if (currentBalance < withdrawAmount) {
-      return res.status(400).json({ error: "Insufficient funds" });
-    }
-
-    // 5. Deduct wallet atomically (Lock funds)
-    const deductResult = await walletRef.transaction((current) => {
-        if (current >= withdrawAmount) return current - withdrawAmount;
-        return current; // Abort if balance is somehow lower
-    });
-
-    if (!deductResult.committed) {
-        return res.status(400).json({ error: "Transaction failed. Insufficient funds." });
-    }
-
-    // 6. Create Paystack Recipient
-    const recipientRes = await fetch("https://api.paystack.co/transferrecipient", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        type: "nuban",
-        name: accountName,
-        account_number: accountNumber,
-        bank_code: bankCode,
-        currency: "NGN"
-      })
-    });
-    const recipientData = await recipientRes.json();
-
-    if (!recipientData.status) {
-        // REFUND if recipient creation fails
-        await walletRef.transaction((current) => (current || 0) + withdrawAmount);
-        return res.status(400).json({ error: recipientData.message || "Invalid bank details" });
-    }
-
 // --- B. SECURE WITHDRAWAL (Manual Admin Approval with PIN Verification) ---
 app.post("/api/withdraw", async (req, res) => {
   try {
@@ -1039,11 +962,9 @@ app.post("/api/withdraw", async (req, res) => {
     const decodedToken = await admin.auth().verifyIdToken(idToken);
     const userId = decodedToken.uid;
 
-    // 1. Extract inputs
     const { amount, bankCode, bankName, accountNumber, accountName, pin } = req.body;
     const withdrawAmount = Math.floor(Number(amount));
 
-    // 2. Validate inputs
     if (!withdrawAmount || withdrawAmount < 1000) {
       return res.status(400).json({ error: "Minimum withdrawal is ₦1,000" });
     }
@@ -1063,7 +984,6 @@ app.post("/api/withdraw", async (req, res) => {
       return res.status(400).json({ error: "Enter account holder name." });
     }
 
-    // 3. Load user + BAN CHECK
     const userSnap = await db.ref(`users/${userId}`).once("value");
     const userData = userSnap.val();
     if (!userData) return res.status(404).json({ error: "User not found." });
@@ -1074,13 +994,11 @@ app.post("/api/withdraw", async (req, res) => {
       return res.status(400).json({ error: "No wallet PIN set. Please set one in Settings." });
     }
 
-    // 4. Verify PIN
     const enteredPinHash = crypto.createHash('sha256').update(pin).digest('hex');
     if (enteredPinHash !== userData.pinHash) {
       return res.status(401).json({ error: "Incorrect Wallet PIN." });
     }
 
-    // 5. Snapshot balance (audit + early reject)
     const walletRef = db.ref(`users/${userId}/walletBalance`);
     const walletSnap = await walletRef.once("value");
     const balanceBefore = Number(walletSnap.val() || 0);
@@ -1088,10 +1006,9 @@ app.post("/api/withdraw", async (req, res) => {
       return res.status(400).json({ error: "Insufficient wallet balance." });
     }
 
-    // 6. ATOMIC DEDUCTION (FIXED: return undefined aborts, return current didn't)
     const deductResult = await walletRef.transaction((current) => {
       const balance = Number(current || 0);
-      if (balance < withdrawAmount) return; // <-- ABORT (was returning current = silent bug)
+      if (balance < withdrawAmount) return; 
       return balance - withdrawAmount;
     });
 
@@ -1100,14 +1017,13 @@ app.post("/api/withdraw", async (req, res) => {
     }
     const newBalance = deductResult.snapshot.val();
 
-    // 7. Create pending request — NO Paystack call, admin handles manually
     const requestRef = db.ref("withdrawalRequests").push();
     await requestRef.set({
       id: requestRef.key,
       uid: userId,
       amount: withdrawAmount,
       balanceBefore: balanceBefore,
-      bank: bankName,          // legacy alias used by admin.js
+      bank: bankName,
       bankName: bankName,
       bankCode: bankCode,
       accountNumber: accountNumber,
@@ -1116,7 +1032,6 @@ app.post("/api/withdraw", async (req, res) => {
       createdAt: admin.database.ServerValue.TIMESTAMP,
     });
 
-    // 8. Notify user
     await db.ref(`notifications/${userId}`).push({
       type: "withdrawal_requested",
       amount: withdrawAmount,
@@ -1137,6 +1052,7 @@ app.post("/api/withdraw", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+ 
 
 // -----------------------------------------------------
 // HEALTH CHECK
