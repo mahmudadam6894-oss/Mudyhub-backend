@@ -590,8 +590,9 @@ function docxPageBreak() {
 app.post('/api/siwes', async (req, res) => {
   if (!process.env.GROQ_API_KEY) {
     return res.status(500).json({ error: "GROQ_API_KEY not set on server." });
-      }
-                  const { uid, formData, images } = req.body;
+  }
+
+  const { uid, formData, images } = req.body;
   if (!uid || !formData) return res.status(400).json({ error: "Missing uid or formData." });
 
   // 🚨 MANDATORY FIELD VALIDATION (Prevents wasted AI calls and protects the user)
@@ -622,8 +623,7 @@ app.post('/api/siwes', async (req, res) => {
         console.log(`[SIWES] Waiting 10s to avoid rate limit...`);
         await new Promise(r => setTimeout(r, 10000));
       }
-    }
-
+        }
     console.log(`[SIWES] All chapters generated. Building DOCX...`);
 
     const children = [];
@@ -844,9 +844,8 @@ app.post('/api/siwes', async (req, res) => {
 
       children.push(docxPageBreak());
     }
-
-    // ===== PACK AND SEND =====
-  const doc = new Document({
+     // ===== PACK AND SEND =====
+    const doc = new Document({
       creator: formData.fullName || "MudyHub Student",
       title: "SIWES Technical Report",
       sections: [{
@@ -1017,12 +1016,18 @@ app.post("/api/withdraw", async (req, res) => {
       createdAt: admin.database.ServerValue.TIMESTAMP, timestamp: Date.now(), ledgerId: ledgerRef.key
     });
 
+    // Firebase first calls this with null (a guess); aborting there would wrongly reject every withdrawal.
+    // Return a placeholder on null so Firebase retries with the real balance, and only debit when the real check passes.
+    let canDebit = false;
     const result = await walletRef.transaction(current => {
-      const balance = Number(current || 0);
+      canDebit = false;
+      if (current === null) return 0;
+      const balance = Number(current);
       if (!Number.isFinite(balance) || balance < withdrawAmount) return;
+      canDebit = true;
       return balance - withdrawAmount;
     });
-    if (!result.committed) {
+    if (!result.committed || !canDebit) {
       await requestRef.remove();
       return res.status(400).json({ error: "Insufficient available wallet balance." });
     }
@@ -1074,4 +1079,6 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Models:`, MODELS);
 });
-  
+
+
+        
