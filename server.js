@@ -773,8 +773,7 @@ app.post('/api/siwes', async (req, res) => {
       `\nThis report presents a detailed account of the Student Industrial Work Experience Scheme (SIWES) attachment undertaken by ${formData.fullName || "the student"} at ${formData.orgName || "an organisation"} from ${formData.startDate || ""} to ${formData.endDate || ""}, as part of the ${formData.level || "ND II"} ${formData.dept || "programme"} at ${formData.institution || "Nuhu Bamalli Polytechnic, Zaria"}. During the attachment, the student worked in the ${formData.orgUnit || "relevant"} unit as a ${formData.jobRole || "student intern"}. The report covers the organisation's profile, the practical experience acquired, the projects handled, the technical and interpersonal challenges encountered, and the lessons learned. The SIWES programme provided invaluable practical exposure that complemented the theoretical knowledge gained in the classroom and significantly enhanced the student's technical and soft skills.`
     ));
     children.push(docxPageBreak());
-
-    // ===== CHAPTERS =====
+  // ===== CHAPTERS =====
     for (const ch of chapters) {
       children.push(docxHeading(ch.title, 1));
       children.push(docxPara(""));
@@ -895,164 +894,152 @@ app.post('/api/siwes', async (req, res) => {
 // MINI-BANK ROUTES (SECURE MONEY HANDLING)
 // =====================================================================
 
-// --- A. SECURE TOP-UP (Paystack) ---
+// --- A. Paystack wallet funding: one canonical wallet, test/live key pairs ---
+function paystackMode() { return String(process.env.PAYSTACK_MODE || "test").toLowerCase() === "live" ? "live" : "test"; }
+function paystackKeys() {
+  const mode = paystackMode();
+  return mode === "live"
+    ? { mode, publicKey: process.env.PAYSTACK_LIVE_PUBLIC_KEY, secretKey: process.env.PAYSTACK_LIVE_SECRET_KEY }
+    : { mode, publicKey: process.env.PAYSTACK_TEST_PUBLIC_KEY, secretKey: process.env.PAYSTACK_TEST_SECRET_KEY };
+}
+async function authenticatedUid(req) {
+  const token = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null;
+  if (!token) throw new Error("Unauthorized");
+  const decoded = await admin.auth().verifyIdToken(token);
+  return decoded.uid;
+}
+app.get("/api/payment-config", async (req, res) => {
+  const keys = paystackKeys();
+  if (!keys.publicKey) return res.status(503).json({ error: `Paystack ${keys.mode} public key is not configured.` });
+  return res.json({ mode: keys.mode, publicKey: keys.publicKey, minTopup: Number(process.env.MIN_TOPUP_NAIRA || 100), maxTopup: Number(process.env.MAX_TOPUP_NAIRA || 100000) });
+});
+app.post("/api/create-topup-intent", async (req, res) => {
+  try {
+    const uid = await authenticatedUid(req);
+    const amount = Number(req.body?.amount);
+    const min = Number(process.env.MIN_TOPUP_NAIRA || 100), max = Number(process.env.MAX_TOPUP_NAIRA || 100000);
+    if (!Number.isSafeInteger(amount) || amount < min || amount > max) return res.status(400).json({ error: `Top-up must be between ₦${min} and ₦${max}.` });
+    const keys = paystackKeys();
+    if (!keys.publicKey || !keys.secretKey) return res.status(503).json({ error: `Paystack ${keys.mode} keys are not configured on the server.` });
+    const user = await admin.auth().getUser(uid);
+    if (!user.email) return res.status(400).json({ error: "Add and verify an email address before funding your wallet." });
+    const reference = `mudy_${keys.mode}_${crypto.randomUUID()}`;
+    await db.ref(`topupIntents/${uid}/${reference}`).set({ uid, amount, amountKobo: amount * 100, currency: "NGN", mode: keys.mode, status: "created", email: user.email, createdAt: admin.database.ServerValue.TIMESTAMP });
+    return res.json({ reference, email: user.email, amount, mode: keys.mode });
+  } catch (error) { return res.status(error.message === "Unauthorized" ? 401 : 500).json({ error: error.message || "Could not create payment." }); }
+});
 app.post("/api/verify-topup", async (req, res) => {
   try {
-    const idToken = req.headers.authorization?.split("Bearer ")[1];
-    if (!idToken) return res.status(401).json({ error: "Unauthorized" });
-    
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    const userId = decodedToken.uid;
-
-    const { reference } = req.body;
-    if (!reference) return res.status(400).json({ error: "Reference is required" });
-
-    const paystackRes = await fetch(`https://api.paystack.co/transaction/verify/${reference}`, {
-      headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
+    const uid = await authenticatedUid(req);
+    const reference = String(req.body?.reference || "").trim();
+    if (!reference || reference.length > 120) return res.status(400).json({ error: "Valid payment reference is required." });
+    const keys = paystackKeys();
+    if (!keys.secretKey) return res.status(503).json({ error: `Paystack ${keys.mode} secret key is not configured.` });
+    const intentRef = db.ref(`topupIntents/${uid}/${reference}`);
+    const intentSnap = await intentRef.once("value");
+    if (!intentSnap.exists()) return res.status(400).json({ error: "Payment intent not found for this account." });
+    const intent = intentSnap.val();
+    if (intent.uid !== uid || intent.mode !== keys.mode || intent.status === "cancelled") return res.status(400).json({ error: "Payment does not match this account or payment mode." });
+    const topupRef = db.ref(`walletTopups/${uid}/${reference}`);
+    const existing = await topupRef.once("value");
+    if (existing.exists() && existing.val()?.status === "completed") return res.json({ success: true, amount: existing.val().amount, alreadyCredited: true });
+    const verifyResponse = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, { headers: { Authorization: `Bearer ${keys.secretKey}` } });
+    const paystack = await verifyResponse.json();
+    const tx = paystack?.data;
+    if (!paystack?.status || tx?.status !== "success") return res.status(400).json({ error: "Paystack has not confirmed a successful payment." });
+    if (Number(tx.amount) !== Number(intent.amountKobo) || tx.currency !== "NGN" || String(tx.reference) !== reference) return res.status(400).json({ error: "Verified payment amount, currency or reference does not match the payment request." });
+    if (String(tx.customer?.email || "").toLowerCase() !== String(intent.email || "").toLowerCase()) return res.status(400).json({ error: "Paystack payer email does not match the payment intent." });
+    const claim = await topupRef.transaction(current => current || ({ uid, amount: intent.amount, reference, mode: keys.mode, currency: "NGN", status: "processing", createdAt: admin.database.ServerValue.TIMESTAMP }));
+    const claimedRecord = claim.snapshot.val();
+    if (claimedRecord?.status === "completed") return res.json({ success: true, amount: claimedRecord.amount, alreadyCredited: true });
+    if (claimedRecord?.status === "credit_failed") return res.status(409).json({ error: "Payment was verified but wallet credit needs support review. Please contact support with your reference." });
+    if (Number(claimedRecord?.amount) !== Number(intent.amount) || claimedRecord?.uid !== uid) return res.status(409).json({ error: "Top-up reference is already associated with a different payment." });
+    const userRef = db.ref(`users/${uid}`);
+    const walletResult = await userRef.transaction(current => {
+      if (!current) return;
+      current.topupCredits = current.topupCredits || {};
+      if (current.topupCredits[reference]) return current;
+      current.walletBalance = Number(current.walletBalance || 0) + Number(intent.amount);
+      current.topupCredits[reference] = true;
+      return current;
     });
-    const paystackData = await paystackRes.json();
-
-    if (!paystackData.status || paystackData.data.status !== "success") {
-      return res.status(400).json({ error: "Payment not successful on Paystack" });
-    }
-
-    const amountPaid = paystackData.data.amount / 100; // Convert Kobo to Naira
-
-    // Idempotency check
-    const topupRef = db.ref(`walletTopups/${userId}/${reference}`);
-    const snapshot = await topupRef.once("value");
-    if (snapshot.exists()) {
-      return res.status(400).json({ error: "This payment was already credited." });
-    }
-
-    // Credit wallet securely
-    const walletRef = db.ref(`users/${userId}/walletBalance`);
-    await walletRef.transaction((current) => (current || 0) + amountPaid);
-
-    // Log the topup
-    await topupRef.set({
-      amount: amountPaid,
-      reference,
-      status: "completed",
-      createdAt: admin.database.ServerValue.TIMESTAMP
-    });
-
-    // Notify user
-    await db.ref(`notifications/${userId}`).push({
-      type: "topup",
-      amount: amountPaid,
-      message: `Wallet credited with ₦${amountPaid.toLocaleString()}.`,
-      createdAt: admin.database.ServerValue.TIMESTAMP,
-      read: false
-    });
-
-    return res.status(200).json({ message: "Wallet credited", amount: amountPaid });
-
-  } catch (error) {
-    console.error("Topup Error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
+    if (!walletResult.committed) { await topupRef.update({ status: "credit_failed", failureReason: "Wallet transaction not committed" }); return res.status(500).json({ error: "Payment verified but wallet credit failed. Contact support with your reference." }); }
+    await topupRef.update({ status: "completed", verifiedAt: admin.database.ServerValue.TIMESTAMP, paystackTransactionId: tx.id || null });
+    await intentRef.update({ status: "completed", completedAt: admin.database.ServerValue.TIMESTAMP });
+    await db.ref(`users/${uid}/transactions/${reference}`).set({ type: "topup", amount: intent.amount, reference, mode: keys.mode, description: "Paystack wallet top-up", status: "completed", createdAt: admin.database.ServerValue.TIMESTAMP });
+    await db.ref(`notifications/${uid}`).push({ type: "topup", amount: intent.amount, message: `Wallet credited with ₦${Number(intent.amount).toLocaleString()}.`, createdAt: admin.database.ServerValue.TIMESTAMP, read: false });
+    return res.json({ success: true, amount: intent.amount, mode: keys.mode });
+  } catch (error) { console.error("Topup verification error:", error); return res.status(error.message === "Unauthorized" ? 401 : 500).json({ error: error.message || "Payment verification failed." }); }
 });
-// --- B. SECURE WITHDRAWAL (Manual Admin Approval with PIN Verification) ---
+// --- B. WITHDRAWAL: atomic request reservation, no fee, manual payout review ---
 app.post("/api/withdraw", async (req, res) => {
+  let uid = null, requestRef = null, ledgerRef = null, walletRef = null, deducted = false;
+  let withdrawAmount = 0;
   try {
-    const idToken = req.headers.authorization?.split("Bearer ")[1];
-    if (!idToken) return res.status(401).json({ error: "Unauthorized" });
-    
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    const userId = decodedToken.uid;
+    uid = await authenticatedUid(req);
+    const { amount, bankCode, bankName, accountNumber, accountName, pin } = req.body || {};
+    withdrawAmount = Number(amount);
+    if (!Number.isSafeInteger(withdrawAmount) || withdrawAmount < 1) return res.status(400).json({ error: "Enter a valid whole-naira withdrawal amount." });
+    if (!pin || !/^\d{4}$/.test(pin)) return res.status(400).json({ error: "Valid 4-digit PIN required." });
+    if (!bankCode || !bankName) return res.status(400).json({ error: "Select a bank." });
+    if (!/^\d{10}$/.test(String(accountNumber || ""))) return res.status(400).json({ error: "Account number must be 10 digits." });
+    if (!accountName || String(accountName).trim().length < 3) return res.status(400).json({ error: "Enter account holder name." });
 
-    const { amount, bankCode, bankName, accountNumber, accountName, pin } = req.body;
-    const withdrawAmount = Math.floor(Number(amount));
+    const userRef = db.ref(`users/${uid}`);
+    const userSnap = await userRef.once("value");
+    const user = userSnap.val();
+    if (!user) return res.status(404).json({ error: "User not found." });
+    if (user.banned === true || user.walletFrozen === true) return res.status(403).json({ error: "Your account or wallet is restricted. Contact support." });
+    if (!user.pinHash) return res.status(400).json({ error: "No wallet PIN set. Please set one in Settings." });
+    const enteredHash = crypto.createHash("sha256").update(pin).digest("hex");
+    if (enteredHash !== user.pinHash) return res.status(401).json({ error: "Incorrect Wallet PIN." });
 
-    if (!withdrawAmount || withdrawAmount < 1000) {
-      return res.status(400).json({ error: "Minimum withdrawal is ₦1,000" });
-    }
-    if (withdrawAmount > 500000) {
-      return res.status(400).json({ error: "Maximum single withdrawal is ₦500,000" });
-    }
-    if (!pin || !/^\d{4}$/.test(pin)) {
-      return res.status(400).json({ error: "Valid 4-digit PIN required." });
-    }
-    if (!bankCode || !bankName) {
-      return res.status(400).json({ error: "Select a bank." });
-    }
-    if (!/^\d{10}$/.test(accountNumber)) {
-      return res.status(400).json({ error: "Account number must be 10 digits." });
-    }
-    if (!accountName || accountName.trim().length < 3) {
-      return res.status(400).json({ error: "Enter account holder name." });
-    }
+    requestRef = db.ref("withdrawalRequests").push();
+    ledgerRef = db.ref(`walletLedger/${uid}`).push();
+    walletRef = db.ref(`users/${uid}/walletBalance`);
 
-    const userSnap = await db.ref(`users/${userId}`).once("value");
-    const userData = userSnap.val();
-    if (!userData) return res.status(404).json({ error: "User not found." });
-    if (userData.banned === true) {
-      return res.status(403).json({ error: "Your account is suspended. Contact support." });
-    }
-    if (!userData.pinHash) {
-      return res.status(400).json({ error: "No wallet PIN set. Please set one in Settings." });
-    }
+    // Create a durable reservation record before touching the balance.
+    await requestRef.set({
+      id: requestRef.key, uid, userId: uid, amount: withdrawAmount, fee: 0, netAmount: withdrawAmount,
+      mode: paystackMode(), bank: String(bankName), bankName: String(bankName), bankCode: String(bankCode),
+      accountNumber: String(accountNumber), accountName: String(accountName).trim(),
+      status: "creating", payoutStatus: "not_paid", payoutNotice: "No bank payout has occurred.",
+      createdAt: admin.database.ServerValue.TIMESTAMP, timestamp: Date.now(), ledgerId: ledgerRef.key
+    });
 
-    const enteredPinHash = crypto.createHash('sha256').update(pin).digest('hex');
-    if (enteredPinHash !== userData.pinHash) {
-      return res.status(401).json({ error: "Incorrect Wallet PIN." });
-    }
-
-    const walletRef = db.ref(`users/${userId}/walletBalance`);
-    const walletSnap = await walletRef.once("value");
-    const balanceBefore = Number(walletSnap.val() || 0);
-    if (balanceBefore < withdrawAmount) {
-      return res.status(400).json({ error: "Insufficient wallet balance." });
-    }
-
-    const deductResult = await walletRef.transaction((current) => {
+    const result = await walletRef.transaction(current => {
       const balance = Number(current || 0);
-      if (balance < withdrawAmount) return; 
+      if (!Number.isFinite(balance) || balance < withdrawAmount) return;
       return balance - withdrawAmount;
     });
-
-    if (!deductResult.committed) {
-      return res.status(400).json({ error: "Insufficient wallet balance." });
+    if (!result.committed) {
+      await requestRef.remove();
+      return res.status(400).json({ error: "Insufficient available wallet balance." });
     }
-    const newBalance = deductResult.snapshot.val();
-
-    const requestRef = db.ref("withdrawalRequests").push();
-    await requestRef.set({
-      id: requestRef.key,
-      uid: userId,
-      amount: withdrawAmount,
-      balanceBefore: balanceBefore,
-      bank: bankName,
-      bankName: bankName,
-      bankCode: bankCode,
-      accountNumber: accountNumber,
-      accountName: accountName,
-      status: "pending",
-      createdAt: admin.database.ServerValue.TIMESTAMP,
+    deducted = true;
+    const now = admin.database.ServerValue.TIMESTAMP;
+    await Promise.all([
+      requestRef.update({ status: "pending", balanceBefore: Number(result.snapshot.val()) + withdrawAmount, balanceAfter: Number(result.snapshot.val()), reservedAt: now }),
+      ledgerRef.set({ id: ledgerRef.key, type: "withdrawal", direction: "debit", amount: withdrawAmount, reference: requestRef.key, description: "Withdrawal request — funds reserved", status: "pending", createdAt: now }),
+      db.ref(`users/${uid}/transactions/${requestRef.key}`).set({ type: "withdrawal", direction: "debit", amount: withdrawAmount, reference: requestRef.key, description: "Withdrawal request — funds reserved", status: "pending", fee: 0, createdAt: now })
+    ]);
+    await db.ref(`notifications/${uid}`).push({
+      type: "withdrawal_requested", amount: withdrawAmount,
+      message: `Withdrawal request of ₦${withdrawAmount.toLocaleString()} submitted for admin review. No bank payout has yet occurred.`,
+      createdAt: now, read: false
     });
-
-    await db.ref(`notifications/${userId}`).push({
-      type: "withdrawal_requested",
-      amount: withdrawAmount,
-      message: `Withdrawal request of ₦${withdrawAmount.toLocaleString()} submitted for admin review.`,
-      createdAt: admin.database.ServerValue.TIMESTAMP,
-      read: false,
-    });
-
-    return res.status(200).json({
-      success: true,
-      requestId: requestRef.key,
-      newBalance: newBalance,
-      message: "Withdrawal request submitted. Admin will review shortly.",
-    });
-
+    return res.json({ success: true, requestId: requestRef.key, newBalance: Number(result.snapshot.val()), fee: 0, message: "Withdrawal request submitted. Funds are reserved while admin reviews it." });
   } catch (error) {
     console.error("Withdraw Error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    // If any post-debit write failed, restore the user's balance and remove the incomplete request.
+    if (deducted && walletRef) {
+      try { await walletRef.transaction(current => Number(current || 0) + withdrawAmount); } catch (refundError) { console.error("Withdrawal rollback failed:", refundError); }
+    }
+    if (requestRef) await requestRef.remove().catch(() => {});
+    if (ledgerRef) await ledgerRef.remove().catch(() => {});
+    return res.status(error.message === "Unauthorized" ? 401 : 500).json({ error: error.message || "Withdrawal request failed." });
   }
 });
- 
 
 // -----------------------------------------------------
 // HEALTH CHECK
@@ -1077,3 +1064,4 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Models:`, MODELS);
 });
+    
