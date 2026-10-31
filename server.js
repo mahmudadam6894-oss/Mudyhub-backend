@@ -590,9 +590,8 @@ function docxPageBreak() {
 app.post('/api/siwes', async (req, res) => {
   if (!process.env.GROQ_API_KEY) {
     return res.status(500).json({ error: "GROQ_API_KEY not set on server." });
-  }
-
-  const { uid, formData, images } = req.body;
+      }
+                  const { uid, formData, images } = req.body;
   if (!uid || !formData) return res.status(400).json({ error: "Missing uid or formData." });
 
   // 🚨 MANDATORY FIELD VALIDATION (Prevents wasted AI calls and protects the user)
@@ -773,7 +772,8 @@ app.post('/api/siwes', async (req, res) => {
       `\nThis report presents a detailed account of the Student Industrial Work Experience Scheme (SIWES) attachment undertaken by ${formData.fullName || "the student"} at ${formData.orgName || "an organisation"} from ${formData.startDate || ""} to ${formData.endDate || ""}, as part of the ${formData.level || "ND II"} ${formData.dept || "programme"} at ${formData.institution || "Nuhu Bamalli Polytechnic, Zaria"}. During the attachment, the student worked in the ${formData.orgUnit || "relevant"} unit as a ${formData.jobRole || "student intern"}. The report covers the organisation's profile, the practical experience acquired, the projects handled, the technical and interpersonal challenges encountered, and the lessons learned. The SIWES programme provided invaluable practical exposure that complemented the theoretical knowledge gained in the classroom and significantly enhanced the student's technical and soft skills.`
     ));
     children.push(docxPageBreak());
-  // ===== CHAPTERS =====
+
+    // ===== CHAPTERS =====
     for (const ch of chapters) {
       children.push(docxHeading(ch.title, 1));
       children.push(docxPara(""));
@@ -846,7 +846,7 @@ app.post('/api/siwes', async (req, res) => {
     }
 
     // ===== PACK AND SEND =====
-    const doc = new Document({
+  const doc = new Document({
       creator: formData.fullName || "MudyHub Student",
       title: "SIWES Technical Report",
       sections: [{
@@ -898,9 +898,15 @@ app.post('/api/siwes', async (req, res) => {
 function paystackMode() { return String(process.env.PAYSTACK_MODE || "test").toLowerCase() === "live" ? "live" : "test"; }
 function paystackKeys() {
   const mode = paystackMode();
+  const clean = v => String(v || "").trim().replace(/^["']|["']$/g, "");
+  // Preferred names first; then legacy names, accepted only if the key prefix matches the active mode.
+  const pick = (names, prefix) => {
+    for (const n of names) { const v = clean(process.env[n]); if (v && v.startsWith(prefix)) return v; }
+    return "";
+  };
   return mode === "live"
-    ? { mode, publicKey: process.env.PAYSTACK_LIVE_PUBLIC_KEY, secretKey: process.env.PAYSTACK_LIVE_SECRET_KEY }
-    : { mode, publicKey: process.env.PAYSTACK_TEST_PUBLIC_KEY, secretKey: process.env.PAYSTACK_TEST_SECRET_KEY };
+    ? { mode, publicKey: pick(["PAYSTACK_LIVE_PUBLIC_KEY", "PAYSTACK_PUBLIC_KEY"], "pk_live_"), secretKey: pick(["PAYSTACK_LIVE_SECRET_KEY", "PAYSTACK_SECRET_KEY"], "sk_live_") }
+    : { mode, publicKey: pick(["PAYSTACK_TEST_PUBLIC_KEY", "PAYSTACK_PUBLIC_KEY"], "pk_test_"), secretKey: pick(["PAYSTACK_TEST_SECRET_KEY", "PAYSTACK_SECRET_KEY"], "sk_test_") };
 }
 async function authenticatedUid(req) {
   const token = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null;
@@ -910,7 +916,7 @@ async function authenticatedUid(req) {
 }
 app.get("/api/payment-config", async (req, res) => {
   const keys = paystackKeys();
-  if (!keys.publicKey) return res.status(503).json({ error: `Paystack ${keys.mode} public key is not configured.` });
+  if (!keys.publicKey) return res.status(503).json({ error: `Paystack ${keys.mode} public key is not configured (it must start with pk_${keys.mode}_).` });
   return res.json({ mode: keys.mode, publicKey: keys.publicKey, minTopup: Number(process.env.MIN_TOPUP_NAIRA || 100), maxTopup: Number(process.env.MAX_TOPUP_NAIRA || 100000) });
 });
 app.post("/api/create-topup-intent", async (req, res) => {
@@ -949,21 +955,25 @@ app.post("/api/verify-topup", async (req, res) => {
     if (!paystack?.status || tx?.status !== "success") return res.status(400).json({ error: "Paystack has not confirmed a successful payment." });
     if (Number(tx.amount) !== Number(intent.amountKobo) || tx.currency !== "NGN" || String(tx.reference) !== reference) return res.status(400).json({ error: "Verified payment amount, currency or reference does not match the payment request." });
     if (String(tx.customer?.email || "").toLowerCase() !== String(intent.email || "").toLowerCase()) return res.status(400).json({ error: "Paystack payer email does not match the payment intent." });
-    const claim = await topupRef.transaction(current => current || ({ uid, amount: intent.amount, reference, mode: keys.mode, currency: "NGN", status: "processing", createdAt: admin.database.ServerValue.TIMESTAMP }));
-    const claimedRecord = claim.snapshot.val();
-    if (claimedRecord?.status === "completed") return res.json({ success: true, amount: claimedRecord.amount, alreadyCredited: true });
-    if (claimedRecord?.status === "credit_failed") return res.status(409).json({ error: "Payment was verified but wallet credit needs support review. Please contact support with your reference." });
-    if (Number(claimedRecord?.amount) !== Number(intent.amount) || claimedRecord?.uid !== uid) return res.status(409).json({ error: "Top-up reference is already associated with a different payment." });
-    const userRef = db.ref(`users/${uid}`);
-    const walletResult = await userRef.transaction(current => {
-      if (!current) return;
-      current.topupCredits = current.topupCredits || {};
-      if (current.topupCredits[reference]) return current;
-      current.walletBalance = Number(current.walletBalance || 0) + Number(intent.amount);
-      current.topupCredits[reference] = true;
+    const claim = await topupRef.transaction(current => {
+      if (!current) return { uid, amount: intent.amount, reference, mode: keys.mode, currency: "NGN", status: "processing", createdAt: admin.database.ServerValue.TIMESTAMP };
+      if (current.status === "credit_failed") return { ...current, status: "processing", retriedAt: Date.now() };
       return current;
     });
-    if (!walletResult.committed) { await topupRef.update({ status: "credit_failed", failureReason: "Wallet transaction not committed" }); return res.status(500).json({ error: "Payment verified but wallet credit failed. Contact support with your reference." }); }
+    const claimedRecord = claim.snapshot.val();
+    if (claimedRecord?.status === "completed") return res.json({ success: true, amount: claimedRecord.amount, alreadyCredited: true });
+    if (Number(claimedRecord?.amount) !== Number(intent.amount) || claimedRecord?.uid !== uid) return res.status(409).json({ error: "Top-up reference is already associated with a different payment." });
+    // Idempotent credit: first claim this reference, then add to the wallet leaf. (Aborting a transaction on a null first read caused credit failures.)
+    const creditFlagRef = db.ref(`users/${uid}/topupCredits/${reference}`);
+    const flag = await creditFlagRef.transaction(current => (current ? undefined : true));
+    if (flag.committed) {
+      const walletResult = await db.ref(`users/${uid}/walletBalance`).transaction(current => Number(current || 0) + Number(intent.amount));
+      if (!walletResult.committed) {
+        await creditFlagRef.remove().catch(() => {});
+        await topupRef.update({ status: "credit_failed", failureReason: "Wallet transaction not committed" });
+        return res.status(500).json({ error: "Payment verified but wallet credit failed. Try again or contact support with your reference." });
+      }
+    }
     await topupRef.update({ status: "completed", verifiedAt: admin.database.ServerValue.TIMESTAMP, paystackTransactionId: tx.id || null });
     await intentRef.update({ status: "completed", completedAt: admin.database.ServerValue.TIMESTAMP });
     await db.ref(`users/${uid}/transactions/${reference}`).set({ type: "topup", amount: intent.amount, reference, mode: keys.mode, description: "Paystack wallet top-up", status: "completed", createdAt: admin.database.ServerValue.TIMESTAMP });
@@ -1064,4 +1074,4 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Models:`, MODELS);
 });
-    
+  
