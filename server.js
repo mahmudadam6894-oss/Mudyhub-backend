@@ -5,6 +5,7 @@ import admin from 'firebase-admin';
 import dotenv from 'dotenv';
 import registerTrueConnection from './true-connection-routes.js';
 import registerAdminV1 from './admin-v1-routes.js';
+import registerPromote from './promote-routes.js';
 import {
   Document, Packer, Paragraph, TextRun, AlignmentType, ImageRun,
   PageBreak, Footer, PageNumber
@@ -1373,6 +1374,7 @@ app.post('/api/admin/publish', async (req, res) => {
 registerTrueConnection({ app, admin, db, authenticatedUid, requireAdmin, writeAudit });
 // V1 admin extras: user lookup/verify, verification (KYC) review, content moderation, mark-withdrawal-paid.
 registerAdminV1({ app, admin, db, requireAdmin, writeAudit, adminResponseError });
+registerPromote({ app, admin, db, authenticatedUid });
 app.get("/api/payment-config", async (req, res) => {
   const keys = paystackKeys();
   if (!keys.publicKey) return res.status(503).json({ error: `Paystack ${keys.mode} public key is not configured (it must start with pk_${keys.mode}_).` });
@@ -1543,4 +1545,4 @@ app.listen(PORT, () => {
 });
 
 
-
+        
