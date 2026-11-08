@@ -3,6 +3,8 @@ import express from 'express';
 import cors from 'cors';
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
+import registerTrueConnection from './true-connection-routes.js';
+import registerAdminV1 from './admin-v1-routes.js';
 import {
   Document, Packer, Paragraph, TextRun, AlignmentType, ImageRun,
   PageBreak, Footer, PageNumber
@@ -14,12 +16,34 @@ const app = express();
 // -----------------------------------------------------
 // MIDDLEWARE
 // -----------------------------------------------------
+const allowedOrigins = new Set(
+  String(process.env.FRONTEND_ORIGINS || 'https://mudihub.netlify.app')
+    .split(',').map(v => v.trim()).filter(Boolean)
+);
 app.use(cors({
-  origin: '*',
+  origin(origin, callback) {
+    // Allow non-browser clients with no Origin header and only configured browser origins.
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    return callback(new Error('Origin not allowed by CORS.'));
+  },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json({ limit: '50mb' }));
+
+// Master Control switches (Super Admin) enforced on the server, not just hidden in the UI.
+let _guardCache = { at: 0, v: {} };
+app.use(async (req, res, next) => {
+  if (req.method !== 'POST' || req.path.startsWith('/api/admin/')) return next();
+  try {
+    if (Date.now() - _guardCache.at > 5000) _guardCache = { at: Date.now(), v: (await db.ref('platformSettings').once('value')).val() || {} };
+    const s = _guardCache.v, p = req.path;
+    if (s.emergencyLock === true) return res.status(503).json({ ok: false, error: 'MudyHub is temporarily locked for safety. Please try again later.' });
+    if (s.walletOpsPaused === true && ['/api/withdraw', '/api/create-topup-intent', '/api/verify-topup'].includes(p)) return res.status(503).json({ ok: false, error: 'Wallet operations are paused for a short while. Please try again later.' });
+    if (s.trueConnectionEnabled === false && p.startsWith('/api/tc/')) return res.status(503).json({ ok: false, error: 'True Connection is temporarily unavailable.' });
+  } catch (e) { /* never block users because the settings read failed */ }
+  return next();
+});
 
 // -----------------------------------------------------
 // ENV CHECK & FIREBASE ADMIN SETUP
@@ -31,17 +55,20 @@ if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
   console.error("FATAL: FIREBASE_SERVICE_ACCOUNT environment variable is not set in Render dashboard.");
 }
 
+if (!process.env.FIREBASE_SERVICE_ACCOUNT) {
+  throw new Error('FIREBASE_SERVICE_ACCOUNT is required. Server startup stopped.');
+}
 try {
   const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
-    databaseURL: "https://mudyhub-default-rtdb.firebaseio.com" // Make sure this is correct
+    databaseURL: process.env.FIREBASE_DATABASE_URL || 'https://mudyhub-default-rtdb.firebaseio.com'
   });
-  console.log("✅ Firebase Admin initialized securely.");
+  console.log('Firebase Admin initialized.');
 } catch (error) {
-  console.error("❌ Failed to initialize Firebase Admin. Check your FIREBASE_SERVICE_ACCOUNT JSON.");
+  console.error('Firebase Admin initialization failed:', error.message);
+  throw error;
 }
-
 const db = admin.database();
 
 // -----------------------------------------------------
@@ -82,7 +109,7 @@ TABLE FORMATTING:
   platform: `You are Mudy AI, the official assistant for MudyHub — an earning and learning platform for African (especially Nigerian) students and young people.
 
 WHAT YOU HELP WITH:
-1. Explaining how MudyHub works: Paid Tasks, Jobs, Daily Rewards, Referral Program, Marketplace, Business Ads, Wallet & Withdrawals, Campus Hub, and Community Feed.
+1. Explaining how MudyHub works: Paid Tasks, Jobs, Daily Rewards, Referral Program, Business Ads, Wallet & Withdrawals, Campus Hub, and Community Feed.
 2. Practical advice on making money online.
 3. Advice on learning valuable skills.
 
@@ -91,7 +118,6 @@ HOW MUDYHUB WORKS:
 - Jobs: verified remote/local listings.
 - Daily Rewards: small bonus claimable once every 24 hours.
 - Referral Program: users share a link and earn when new users sign up.
-- Marketplace: users list products/services (admin-approved).
 - Wallet: shows balance, pending earnings, withdrawal history.
 - Campus Hub: student-focused section with daily quiz, CGPA calculator, AI academic assistant.
 
@@ -153,6 +179,8 @@ async function callGroq({ systemPrompt, messages, model, jsonMode = false, maxTo
 // /api/generate — AI CHAT
 // -----------------------------------------------------
 app.post('/api/generate', async (req, res) => {
+  try { const uid = await authenticatedUid(req); const userSnap = await db.ref(`users/${uid}`).once('value'); const u = userSnap.val(); if (!u || u.banned === true || u.status === 'banned') return res.status(403).json({ response: 'Your account is not permitted to use this service.' }); }
+  catch (_) { return res.status(401).json({ response: 'Please sign in to use Mudy AI.' }); }
   if (!process.env.GROQ_API_KEY) {
     return res.status(500).json({ response: "Server misconfiguration: GROQ_API_KEY is not set." });
   }
@@ -245,6 +273,8 @@ function isValidQuizPayload(data) {
 }
 
 app.get('/api/quiz', async (req, res) => {
+  try { const uid = await authenticatedUid(req); const userSnap = await db.ref(`users/${uid}`).once('value'); const u = userSnap.val(); if (!u || u.banned === true || u.status === 'banned') return res.status(403).json({ error: 'Your account is not permitted to use this service.' }); }
+  catch (_) { return res.status(401).json({ error: 'Please sign in to load the quiz.' }); }
   if (!process.env.GROQ_API_KEY) return res.status(500).json({ error: "GROQ_API_KEY not set." });
   try {
     const rawText = await callGroq({
@@ -592,8 +622,12 @@ app.post('/api/siwes', async (req, res) => {
     return res.status(500).json({ error: "GROQ_API_KEY not set on server." });
   }
 
-  const { uid, formData, images } = req.body;
-  if (!uid || !formData) return res.status(400).json({ error: "Missing uid or formData." });
+  let uid;
+  try { uid = await authenticatedUid(req); }
+  catch (_) { return res.status(401).json({ error: 'Please sign in before generating a SIWES report.' }); }
+  const { uid: suppliedUid, formData, images } = req.body || {};
+  if (suppliedUid && suppliedUid !== uid) return res.status(403).json({ error: 'The submitted account does not match your signed-in account.' });
+  if (!formData || typeof formData !== 'object') return res.status(400).json({ error: 'Missing report form data.' });
 
   // 🚨 MANDATORY FIELD VALIDATION (Prevents wasted AI calls and protects the user)
   const requiredFields = ['fullName', 'matric', 'dept', 'institution', 'orgName', 'startDate', 'endDate'];
@@ -603,7 +637,32 @@ app.post('/api/siwes', async (req, res) => {
     }
   }
 
+  const requestId = String(req.body?.requestId || '').trim();
+  if (!/^[A-Za-z0-9_-]{12,100}$/.test(requestId)) return res.status(400).json({ error: 'Invalid report request reference. Please try again.' });
+  const reportFee = Number(process.env.SIWES_REPORT_FEE_NAIRA || 1000);
+  if (!Number.isSafeInteger(reportFee) || reportFee < 0) return res.status(503).json({ error: 'SIWES report fee is not configured correctly.' });
+  const siwesUserRef = db.ref(`users/${uid}`);
+  const siwesUserSnap = await siwesUserRef.once('value');
+  const siwesUser = siwesUserSnap.val();
+  if (!siwesUser || siwesUser.banned === true || siwesUser.status === 'banned' || siwesUser.walletFrozen === true) return res.status(403).json({ error: 'Your account or wallet is restricted.' });
+  if (siwesUser.siwesCharges && siwesUser.siwesCharges[requestId]) return res.status(409).json({ error: 'This report request has already been used. Start a new report request.' });
   try {
+  let insufficientBalance = false;
+  const chargeResult = await siwesUserRef.transaction(user => {
+    if (user === null) return user;   // first local run is null in the Admin SDK: let Firebase retry with the real value
+    const charges = user.siwesCharges || {};
+    if (charges[requestId]) return;
+    const balance = Number(user.walletBalance || 0);
+    if (!Number.isFinite(balance) || balance < reportFee) { insufficientBalance = true; return; }
+    user.walletBalance = balance - reportFee;
+    charges[requestId] = { amount: reportFee, status: 'processing', createdAt: Date.now() };
+    user.siwesCharges = charges;
+    return user;
+  });
+  if (!chargeResult.committed) return res.status(400).json({ error: insufficientBalance ? 'Insufficient wallet balance.' : 'Could not reserve the SIWES report fee. Please retry.' });
+  await db.ref(`users/${uid}/transactions/siwes_${requestId}`).set({ type:'siwes_report', amount:-reportFee, status:'processing', reference:requestId, createdAt:Date.now() });
+  await db.ref(`walletLedger/${uid}/siwes_${requestId}`).set({ type:'siwes_report', direction:'debit', amount:reportFee, reference:requestId, description:'SIWES report generation fee', status:'processing', createdAt:Date.now() });
+
     console.log(`[SIWES] Starting for uid=${uid}, org=${formData.orgName}, dept=${formData.dept}`);
 
     const prompts = buildChapterPrompts(formData);
@@ -877,6 +936,9 @@ app.post('/api/siwes', async (req, res) => {
     });
 
     const buffer = await Packer.toBuffer(doc);
+    await db.ref(`users/${uid}/transactions/siwes_${requestId}`).update({ status:'completed', completedAt:Date.now() });
+    await db.ref(`walletLedger/${uid}/siwes_${requestId}`).update({ status:'completed', completedAt:Date.now() });
+    await siwesUserRef.child(`siwesCharges/${requestId}`).update({ status:'completed', completedAt:Date.now() });
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     res.setHeader("Content-Disposition", `attachment; filename="SIWES_Report_${formData.matric || uid}.docx"`);
@@ -885,7 +947,27 @@ app.post('/api/siwes', async (req, res) => {
     console.log(`[SIWES] ✅ Report sent for uid=${uid}, size=${buffer.length} bytes`);
   } catch (error) {
     console.error("[SIWES] Error:", error);
-    res.status(500).json({ error: error.message || "Failed to generate SIWES report." });
+    let refunded = false;
+    try {
+      const refund = await siwesUserRef.transaction(user => {
+        if (user === null) return user;   // first local run is null in the Admin SDK: let Firebase retry with the real value
+        const charges = user.siwesCharges || {};
+        const charge = charges[requestId];
+        if (!charge || charge.status === 'completed' || charge.status === 'refunded') return user;
+        const claims = user.siwesRefundClaims || {};
+        if (claims[requestId]) return user;
+        user.walletBalance = Number(user.walletBalance || 0) + reportFee;
+        claims[requestId] = true; user.siwesRefundClaims = claims;
+        charges[requestId] = { ...charge, status:'refunded', refundedAt:Date.now() };
+        user.siwesCharges = charges; refunded = true;
+        return user;
+      });
+      if (refund.committed && refunded) {
+        await db.ref(`users/${uid}/transactions/siwes_${requestId}`).update({ status:'refunded', refundedAt:Date.now() });
+        await db.ref(`walletLedger/${uid}/siwes_${requestId}`).update({ status:'refunded', refundedAt:Date.now() });
+      }
+    } catch (refundError) { console.error('[SIWES] Automatic refund failed:', refundError); }
+    res.status(500).json({ error: (error.message || "Failed to generate SIWES report.") + (refunded ? ' The report fee has been returned to your wallet.' : ' If your wallet was charged, contact support with reference ' + requestId + '.') });
   }
 });
 
@@ -910,9 +992,387 @@ function paystackKeys() {
 async function authenticatedUid(req) {
   const token = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null;
   if (!token) throw new Error("Unauthorized");
-  const decoded = await admin.auth().verifyIdToken(token);
-  return decoded.uid;
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    return decoded.uid;
+  } catch (_) {
+    throw new Error("Unauthorized");
+  }
 }
+
+
+// =====================================================================
+// ADMIN AUTHORIZATION + AUDIT — all privileged actions are server-checked
+// =====================================================================
+const ADMIN_MODULES = new Set(['tasks', 'campaigns', 'withdrawals', 'campus', 'support', 'verification', 'moderation', 'trueConnection', 'business']);
+async function requireAdmin(req, permission = null) {
+  const uid = await authenticatedUid(req);
+  const authUser = await admin.auth().getUser(uid).catch(() => null);
+  if (!authUser || authUser.disabled || !authUser.emailVerified) throw new Error('Forbidden');
+  const snap = await db.ref(`admins/${uid}`).once('value');
+  const raw = snap.val();
+  if (!raw) throw new Error('Forbidden');
+  const record = raw === true ? { role: 'super_admin', status: 'active', name: 'Super Admin' } : raw;
+  if (record.status === 'banned' || record.status === 'disabled') throw new Error('Forbidden');
+  if (!['super_admin', 'normal_admin'].includes(record.role)) throw new Error('Forbidden');
+  if (permission && record.role !== 'super_admin') {
+    const allowed = permission === 'tc:moderate'
+      ? record.permissions?.trueConnection === true
+      : record.permissions?.[permission] === true;
+    if (!allowed) throw new Error('Forbidden');
+  }
+  return { uid, role: record.role, name: record.name || record.fullName || 'Admin', permissions: record.permissions || {}, status: record.status || 'active' };
+}
+async function writeAudit(actor, action, targetType = 'platform', targetId = '', reason = '', before = null, after = null) {
+  const entry = {
+    adminUid: actor.uid, adminName: actor.name || 'Admin', role: actor.role,
+    action: String(action || 'admin_action').slice(0, 120), targetType: String(targetType || '').slice(0, 80),
+    targetId: String(targetId || '').slice(0, 160), reason: String(reason || '').slice(0, 500),
+    before: before == null ? null : before, after: after == null ? null : after, createdAt: Date.now()
+  };
+  const ref = db.ref('adminAuditLog').push();
+  await ref.set(entry);
+  await db.ref('admin_logs').push().set(entry);
+  return ref.key;
+}
+function adminResponseError(res, error) {
+  const status = error.message === 'Unauthorized' ? 401 : error.message === 'Forbidden' ? 403 : 400;
+  return res.status(status).json({ ok: false, error: status === 403 ? 'You do not have permission for this action.' : error.message || 'Admin action failed.' });
+}
+app.get('/api/admin/me', async (req, res) => {
+  try { return res.json({ ok: true, admin: await requireAdmin(req) }); }
+  catch (e) { return adminResponseError(res, e); }
+});
+app.post('/api/admin/log', async (req, res) => {
+  try { const actor = await requireAdmin(req); const id = await writeAudit(actor, req.body?.action || 'admin_log'); return res.json({ ok: true, id }); }
+  catch (e) { return adminResponseError(res, e); }
+});
+app.post('/api/admin/manager/grant', async (req, res) => {
+  try {
+    const actor = await requireAdmin(req);
+    if (actor.role !== 'super_admin') throw new Error('Forbidden');
+    const uid = String(req.body?.uid || '').trim();
+    if (!/^[A-Za-z0-9_-]{20,128}$/.test(uid)) throw new Error('Invalid user ID.');
+    const authUser = await admin.auth().getUser(uid);
+    if (authUser.disabled) throw new Error('This account is disabled.');
+    const current = await db.ref(`admins/${uid}`).once('value');
+    if (current.exists()) throw new Error('This user already has an admin record.');
+    const record = { name: String(req.body?.name || authUser.displayName || 'Admin').slice(0,100), phone: String(req.body?.phone || '').slice(0,30), role: 'normal_admin', status: 'active', permissions: {}, createdAt: Date.now(), createdBy: actor.uid };
+    await db.ref(`admins/${uid}`).set(record);
+    await writeAudit(actor, 'grant_admin_access', 'admin', uid, '', null, { role: record.role, status: record.status });
+    return res.json({ ok: true });
+  } catch (e) { return adminResponseError(res, e); }
+});
+app.post('/api/admin/manager/update', async (req, res) => {
+  try {
+    const actor = await requireAdmin(req);
+    if (actor.role !== 'super_admin') throw new Error('Forbidden');
+    const uid = String(req.body?.uid || '').trim();
+    if (!uid || uid === actor.uid) throw new Error('You cannot change your own admin record here.');
+    const targetRef = db.ref(`admins/${uid}`); const snap = await targetRef.once('value');
+    if (!snap.exists()) throw new Error('Admin not found.');
+    const old = snap.val(); if (old === true || old.role === 'super_admin') throw new Error('Super Admin records cannot be changed here.');
+    const patch = {};
+    if (req.body?.status !== undefined) {
+      if (!['active','banned','disabled'].includes(req.body.status)) throw new Error('Invalid admin status.');
+      patch.status = req.body.status;
+    }
+    if (req.body?.permissions !== undefined) {
+      const perms = req.body.permissions || {};
+      const keys = Object.keys(perms).filter(k => perms[k] === true);
+      if (keys.length > 3) throw new Error('A Normal Admin can have no more than 3 assigned modules.');
+      if (keys.some(k => !ADMIN_MODULES.has(k))) throw new Error('One or more permissions are not available in V1.');
+      patch.permissions = Object.fromEntries([...ADMIN_MODULES].map(k => [k, keys.includes(k)]));
+    }
+    if (!Object.keys(patch).length) throw new Error('No valid admin changes supplied.');
+    await targetRef.update(patch);
+    await writeAudit(actor, 'update_admin', 'admin', uid, '', old, patch);
+    return res.json({ ok: true });
+  } catch (e) { return adminResponseError(res, e); }
+});
+app.post('/api/admin/wallet/adjust', async (req, res) => {
+  try {
+    const actor = await requireAdmin(req);
+    if (actor.role !== 'super_admin') throw new Error('Forbidden');
+    const uid = String(req.body?.uid || '').trim();
+    const amount = Number(req.body?.amount);
+    const reason = String(req.body?.reason || '').trim().slice(0,500);
+    if (!uid || uid === actor.uid || !Number.isFinite(amount) || amount === 0 || Math.abs(amount) > 1000000 || reason.length < 10) throw new Error('Provide a valid user, adjustment amount (maximum ₦1,000,000), and a reason of at least 10 characters.');
+    const adjustmentId = db.ref(`walletLedger/${uid}`).push().key;
+    const userRef = db.ref(`users/${uid}`);
+    const targetSnap = await userRef.once('value');
+    if (!targetSnap.exists()) throw new Error('User not found.');
+    const ledgerRef = db.ref(`walletLedger/${uid}/${adjustmentId}`);
+    await ledgerRef.set({ type:'admin_adjustment', direction:amount>0?'credit':'debit', amount:Math.abs(amount), signedAmount:amount, reference:adjustmentId, description:reason, status:'processing', createdAt:Date.now(), adminUid:actor.uid, adminName:actor.name });
+    const result = await userRef.transaction(user => {
+      if (user === null) return user;   // first local run is null in the Admin SDK: let Firebase retry with the real value
+      const claims = user.adminWalletAdjustments || {};
+      if (claims[adjustmentId]) return user;
+      const balance = Number(user.walletBalance || 0);
+      const next = Math.round((balance + amount) * 100) / 100;
+      if (!Number.isFinite(next) || next < 0) return;
+      user.walletBalance = next;
+      claims[adjustmentId] = { amount, reason, by:actor.uid, at:Date.now() };
+      user.adminWalletAdjustments = claims;
+      return user;
+    });
+    if (!result.committed) {
+      await ledgerRef.update({ status:'failed', failedAt:Date.now(), failureReason:'Wallet transaction was not committed.' });
+      throw new Error('Wallet adjustment was not committed. Check the user balance and try again.');
+    }
+    await ledgerRef.update({ status:'completed', completedAt:Date.now(), balanceAfter:Number(result.snapshot.val()?.walletBalance || 0) });
+    await writeAudit(actor, 'admin_wallet_adjustment', 'userWallet', uid, reason, { balanceBefore:Number(targetSnap.val()?.walletBalance || 0) }, { amount, adjustmentId, balanceAfter:Number(result.snapshot.val()?.walletBalance || 0) });
+    await db.ref(`notifications/${uid}/wallet_adjust_${adjustmentId}`).set({ type:'wallet_adjustment', amount, message:amount>0?`An admin adjustment of ₦${amount.toLocaleString()} was credited to your wallet.`:`An admin adjustment of ₦${Math.abs(amount).toLocaleString()} was debited from your wallet.`, createdAt:Date.now(), read:false });
+    return res.json({ok:true, adjustmentId, balance:Number(result.snapshot.val()?.walletBalance || 0)});
+  } catch (e) { return adminResponseError(res, e); }
+});
+app.post('/api/admin/user/ban', async (req, res) => {
+  try {
+    const actor = await requireAdmin(req, 'support');
+    const uid = String(req.body?.uid || '').trim();
+    const banned = req.body?.banned === true;
+    const reason = String(req.body?.reason || '').trim().slice(0,500);
+    if (!uid || uid === actor.uid) throw new Error('Invalid target user.');
+    const userRef = db.ref(`users/${uid}`); const snap = await userRef.once('value');
+    if (!snap.exists()) throw new Error('User not found.');
+    const before = { banned: snap.val().banned === true, status: snap.val().status || 'active' };
+    await userRef.update({ banned, status: banned ? 'banned' : 'active', bannedAt: banned ? Date.now() : null, bannedBy: banned ? actor.uid : null, banReason: banned ? (reason || 'Policy violation') : null });
+    await writeAudit(actor, banned ? 'ban_user' : 'unban_user', 'user', uid, reason, before, { banned, status: banned ? 'banned' : 'active' });
+    await db.ref(`notifications/${uid}`).push({ type: 'account_status', message: banned ? 'Your MudyHub account has been restricted. Contact support for assistance.' : 'Your MudyHub account restriction has been lifted.', createdAt: Date.now(), read: false });
+    return res.json({ ok: true });
+  } catch (e) { return adminResponseError(res, e); }
+});
+app.post('/api/admin/task/review', async (req, res) => {
+  try {
+    const actor = await requireAdmin(req, 'tasks');
+    const id = String(req.body?.id || '').trim(); const decision = req.body?.decision;
+    const reason = String(req.body?.reason || '').trim().slice(0,500);
+    if (!id || !['approve','reject'].includes(decision)) throw new Error('Invalid task review request.');
+    const itemRef = db.ref(`submissions/${id}`); const snap = await itemRef.once('value');
+    if (!snap.exists()) throw new Error('Submission not found.');
+    const item = snap.val();
+    if (item.status === 'approved' || item.status === 'rejected') throw new Error('This submission has already been reviewed.');
+    const uid = String(item.userId || item.uid || ''); if (!uid) throw new Error('Submission has no user ID.');
+    if (decision === 'reject') {
+      await itemRef.update({ status: 'rejected', rejectionReason: reason || 'Submission did not meet the task requirements.', reviewedAt: Date.now(), reviewedBy: actor.uid });
+      await db.ref(`notifications/${uid}`).push({ type:'task_rejected', message:`Your task submission was rejected. Reason: ${reason || 'Submission did not meet the task requirements.'}`, createdAt:Date.now(), read:false });
+      await writeAudit(actor, 'reject_task_submission', 'submission', id, reason, {status:item.status}, {status:'rejected'});
+      return res.json({ ok:true, status:'rejected' });
+    }
+    // Never trust a reward typed into the browser: take it from the campaign/task record when one exists.
+    let gross = Number(item.rewardAmount || 0);
+    const sourceId = String(item.campaignId || '').trim();
+    if (sourceId && !/[.#$\[\]\/]/.test(sourceId)) {
+      for (const node of ['campaigns', 'adminCreatedTasks']) {
+        const src = (await db.ref(`${node}/${sourceId}`).once('value')).val();
+        const trusted = src ? Number(src.reward ?? src.rewardPerAction ?? 0) : 0;
+        if (Number.isFinite(trusted) && trusted > 0) { gross = trusted; break; }
+      }
+    }
+    if (!Number.isFinite(gross) || gross <= 0 || gross > 1000000) throw new Error('Invalid task reward amount.');
+    const settings = (await db.ref('platformSettings').once('value')).val() || {};
+    const rate = Math.min(1, Math.max(0, Number(settings.platformFeeRate ?? 0.20)));
+    const calculatedFee = Math.round(gross * rate * 100) / 100;
+    const calculatedNet = Math.round((gross - calculatedFee) * 100) / 100;
+    const userRef = db.ref(`users/${uid}`);
+    let alreadyCredited = false, net = calculatedNet, fee = calculatedFee;
+    const credit = await userRef.transaction(user => {
+      if (user === null) return user;   // first local run is null in the Admin SDK: let Firebase retry with the real value
+      const claims = user.adminCreditClaims || {};
+      const existing = claims[`task_${id}`];
+      if (existing) { alreadyCredited = true; net = Number(existing.net || calculatedNet); fee = Number(existing.fee || calculatedFee); return user; }
+      user.walletBalance = Number(user.walletBalance || 0) + calculatedNet;
+      user.lifetimeEarned = Number(user.lifetimeEarned || 0) + calculatedNet;
+      claims[`task_${id}`] = { net: calculatedNet, fee: calculatedFee, gross, at: Date.now() }; user.adminCreditClaims = claims;
+      return user;
+    });
+    if (!credit.committed || !credit.snapshot.exists()) throw new Error('Wallet credit could not be committed.');
+    const ts = Date.now();
+    if (fee > 0 && !alreadyCredited) {
+      const revenueClaim = await db.ref(`platformRevenue/creditClaims/task_${id}`).transaction(cur => cur ? undefined : { by:actor.uid, at:ts, fee });
+      if (revenueClaim.committed) {
+        await db.ref('platformRevenue/total').transaction(v => Number(v || 0) + fee);
+        await db.ref('platformRevenue/bySource/earning_hub').transaction(v => Number(v || 0) + fee);
+        await db.ref('platformRevenue/recent').push({ amount:fee, gross, userShare:net, source:'earning_hub', sourceId:id, userId:uid, description:item.campaignTitle || 'Earning Hub task payout', createdAt:ts });
+      }
+    }
+    await db.ref(`walletLedger/${uid}/task_${id}`).set({ type:'earning', direction:'credit', amount:net, gross, fee, reference:id, description:item.campaignTitle || 'Earning Hub task payout', status:'completed', createdAt:ts, adminUid:actor.uid });
+    await itemRef.update({ status:'approved', reviewedAt:ts, reviewedBy:actor.uid, netCredited:net, platformFee:fee });
+    await db.ref(`notifications/${uid}/task_${id}`).set({ type:'payout', amount:net, gross, fee, message:`Your task reward of ₦${net.toLocaleString()} has been credited to your wallet.`, createdAt:ts, read:false });
+    await writeAudit(actor, 'approve_task_submission', 'submission', id, '', {status:item.status, reward:gross}, {status:'approved', netCredited:net, platformFee:fee});
+    return res.json({ ok:true, status:'approved', netCredited:net, platformFee:fee });
+  } catch (e) { return adminResponseError(res, e); }
+});
+app.post('/api/admin/withdrawal/action', async (req, res) => {
+  try {
+    const actor = await requireAdmin(req, 'withdrawals');
+    const id = String(req.body?.id || '').trim(); const action = req.body?.action;
+    const reason = String(req.body?.reason || '').trim().slice(0,500);
+    if (!id || !['approve','reject_refund','fraud_review','force_approve'].includes(action)) throw new Error('Invalid withdrawal action.');
+    if (action === 'force_approve' && actor.role !== 'super_admin') throw new Error('Forbidden');
+    const reqRef = db.ref(`withdrawalRequests/${id}`); const snap = await reqRef.once('value');
+    if (!snap.exists()) throw new Error('Withdrawal request not found.');
+    const w = snap.val(); const uid = String(w.uid || w.userId || ''); const amount = Number(w.amount || 0);
+    if (!uid || !Number.isFinite(amount) || amount <= 0) throw new Error('Withdrawal record is incomplete.');
+    if (!['pending','processing'].includes(w.status)) throw new Error('This withdrawal is no longer awaiting review.');
+    if (action === 'approve' || action === 'force_approve') {
+      if (action === 'force_approve' && reason.length < 10) throw new Error('Force-approval requires a reason of at least 10 characters.');
+      await reqRef.update({ status:'approved', payoutStatus:'approved_awaiting_manual_payout', payoutNotice:'Admin approved this request; bank payout must be completed and confirmed separately.', approvedAt:Date.now(), approvedBy:actor.uid, ...(action === 'force_approve' ? {forceApprovedBy:actor.uid, forceApproveReason:reason} : {}) });
+      await db.ref(`notifications/${uid}`).push({ type:'withdrawal_approved', amount, message:`Your withdrawal of ₦${amount.toLocaleString()} has been approved. Bank payout is not yet confirmed.`, createdAt:Date.now(), read:false });
+      await writeAudit(actor, action === 'force_approve' ? 'force_approve_withdrawal' : 'approve_withdrawal', 'withdrawal', id, reason, {status:w.status}, {status:'approved', payoutStatus:'approved_awaiting_manual_payout'});
+      return res.json({ok:true,status:'approved'});
+    }
+    if (action === 'fraud_review') {
+      if (reason.length < 5) throw new Error('Provide a fraud-review reason of at least 5 characters.');
+      await db.ref(`users/${uid}`).update({ walletFrozen:true, walletFrozenAt:Date.now(), walletFrozenBy:actor.uid, walletFreezeReason:reason });
+      await reqRef.update({ status:'processing', payoutStatus:'fraud_review', rejectionReason:reason, fraudReviewAt:Date.now(), fraudReviewBy:actor.uid });
+      await writeAudit(actor, 'withdrawal_fraud_review', 'withdrawal', id, reason, {status:w.status}, {status:'processing', payoutStatus:'fraud_review'});
+      await db.ref(`notifications/${uid}`).push({ type:'withdrawal_review', message:'Your withdrawal is under additional security review. The requested funds remain reserved.', createdAt:Date.now(), read:false });
+      return res.json({ok:true,status:'processing'});
+    }
+    if (!reason) throw new Error('A rejection reason is required.');
+    const userRef = db.ref(`users/${uid}`);
+    let alreadyRefunded = false;
+    const refund = await userRef.transaction(user => {
+      if (user === null) return user;   // first local run is null in the Admin SDK: let Firebase retry with the real value
+      const claims = user.adminRefundClaims || {};
+      if (claims[`withdrawal_${id}`]) { alreadyRefunded = true; return user; }
+      user.walletBalance = Number(user.walletBalance || 0) + amount;
+      claims[`withdrawal_${id}`] = { amount, at: Date.now() }; user.adminRefundClaims = claims;
+      return user;
+    });
+    if (!refund.committed || !refund.snapshot.exists()) throw new Error('User record is unavailable; refund was not processed.');
+    await reqRef.update({ status:'rejected', rejectionReason:reason, rejectedAt:Date.now(), refundedAt:Date.now(), refundedAmount:amount, refundProcessedBy:actor.uid });
+    if (w.ledgerId) await db.ref(`walletLedger/${uid}/${w.ledgerId}`).update({status:'refunded', refundedAt:Date.now(), refundReason:reason});
+    await db.ref(`walletLedger/${uid}/withdrawal_refund_${id}`).set({type:'withdrawal_refund',direction:'credit',amount,reference:id,description:'Refund for rejected withdrawal',status:'completed',createdAt:Date.now(),adminUid:actor.uid});
+    await db.ref(`notifications/${uid}/withdrawal_rejected_${id}`).set({type:'withdrawal_rejected',amount,message:`Withdrawal rejected. ${reason}. Funds returned to your wallet.`,createdAt:Date.now(),read:false});
+    await writeAudit(actor, 'reject_withdrawal_refund', 'withdrawal', id, reason, {status:w.status}, {status:'rejected', refundedAmount:amount});
+    return res.json({ok:true,status:'rejected',refundedAmount:amount});
+  } catch (e) { return adminResponseError(res, e); }
+});
+app.post('/api/admin/campaign/review', async (req, res) => {
+  try {
+    const actor = await requireAdmin(req, 'campaigns');
+    const id = String(req.body?.id || '').trim();
+    const node = req.body?.node === 'adminAds' ? 'adminAds' : 'campaigns';
+    const decision = req.body?.decision;
+    const reason = String(req.body?.reason || '').trim().slice(0,500);
+    if (!id || !['approve','reject'].includes(decision)) throw new Error('Invalid campaign review request.');
+    const itemRef = db.ref(`${node}/${id}`); const snap = await itemRef.once('value');
+    if (!snap.exists()) throw new Error('Campaign not found.');
+    const item = snap.val();
+    if (!['pending','review'].includes(item.status)) throw new Error('This campaign is not awaiting review.');
+    if (decision === 'reject') {
+      if (!reason) throw new Error('A rejection reason is required.');
+      const creatorUid = String(item.creatorId || item.userId || '');
+      const escrow = Math.max(0, Number(item.totalEscrowLocked || 0));
+      if (escrow > 0 && creatorUid) {
+        const userRef = db.ref(`users/${creatorUid}`);
+        let alreadyRefunded = false;
+        const refund = await userRef.transaction(user => {
+          if (user === null) return user;   // first local run is null in the Admin SDK: let Firebase retry with the real value
+          const claims = user.adminRefundClaims || {};
+          if (claims[`campaign_${id}`]) { alreadyRefunded = true; return user; }
+          user.walletBalance = Number(user.walletBalance || 0) + escrow;
+          claims[`campaign_${id}`] = { amount:escrow, at:Date.now() }; user.adminRefundClaims = claims;
+          return user;
+        });
+        if (!refund.committed || !refund.snapshot.exists()) throw new Error('Campaign escrow refund could not be committed. Review the account before retrying.');
+        await db.ref(`walletLedger/${creatorUid}/campaign_refund_${id}`).set({type:'campaign_refund',direction:'credit',amount:escrow,reference:id,description:'Refund for rejected Promote campaign',status:'completed',createdAt:Date.now(),adminUid:actor.uid});
+      }
+      await itemRef.update({status:'rejected',rejectionReason:reason,reviewedAt:Date.now(),reviewedBy:actor.uid,totalEscrowLocked:0,escrowReleasedAt:Date.now()});
+      if (creatorUid) await db.ref(`notifications/${creatorUid}/campaign_rejected_${id}`).set({type:'campaign_rejected',message:`Your campaign was rejected. Reason: ${reason}${escrow>0?' Escrow was returned to your wallet.':''}`,createdAt:Date.now(),read:false});
+      await writeAudit(actor,'reject_campaign','campaign',id,reason,{status:item.status,totalEscrowLocked:escrow},{status:'rejected',refunded:escrow});
+      return res.json({ok:true,status:'rejected',refunded:escrow});
+    }
+    await itemRef.update({status:'active',reviewedAt:Date.now(),reviewedBy:actor.uid});
+    const creatorUid = String(item.creatorId || item.userId || '');
+    if (creatorUid) await db.ref(`notifications/${creatorUid}`).push({type:'campaign_approved',message:'Your Promote campaign is now live.',createdAt:Date.now(),read:false});
+    await writeAudit(actor,'approve_campaign','campaign',id,'',{status:item.status},{status:'active'});
+    return res.json({ok:true,status:'active'});
+  } catch (e) { return adminResponseError(res, e); }
+});
+app.post('/api/admin/campus/review', async (req, res) => {
+  try {
+    const actor = await requireAdmin(req, 'campus'); const uid = String(req.body?.uid || '').trim();
+    const decision = req.body?.decision; const reason = String(req.body?.reason || '').trim().slice(0,500);
+    if (!uid || !['approve','reject'].includes(decision)) throw new Error('Invalid campus review request.');
+    const status = decision === 'approve' ? 'approved' : 'rejected'; const patch = {status, reviewedAt:Date.now(), reviewedBy:actor.uid};
+    if (decision === 'reject') patch.rejectionReason = reason || 'Verification details could not be confirmed.';
+    await db.ref(`campusVerifications/${uid}`).update(patch);
+    await db.ref(`users/${uid}/campusVerification`).update(patch);
+    await db.ref(`notifications/${uid}`).push({type:'campus_verification',message:decision === 'approve' ? 'Your Campus Hub verification has been approved.' : `Your Campus Hub verification was declined. ${patch.rejectionReason}`,createdAt:Date.now(),read:false});
+    await writeAudit(actor, 'review_campus_verification', 'campusVerification', uid, reason, null, patch);
+    return res.json({ok:true,status});
+  } catch (e) { return adminResponseError(res, e); }
+});
+app.post('/api/admin/support/resolve', async (req, res) => {
+  try {
+    const actor = await requireAdmin(req, 'support'); const id = String(req.body?.id || '').trim();
+    if (!id) throw new Error('Ticket ID is required.');
+    const ticketRef = db.ref(`supportTickets/${id}`); const snap = await ticketRef.once('value');
+    if (!snap.exists()) throw new Error('Support ticket not found.');
+    const before = snap.val(); await ticketRef.update({status:'resolved',resolvedAt:Date.now(),resolvedBy:actor.uid});
+    await writeAudit(actor, 'resolve_support_ticket', 'supportTicket', id, '', {status:before.status}, {status:'resolved'});
+    return res.json({ok:true});
+  } catch (e) { return adminResponseError(res, e); }
+});
+app.post('/api/admin/settings', async (req, res) => {
+  try {
+    const actor = await requireAdmin(req); if (actor.role !== 'super_admin') throw new Error('Forbidden');
+    const input = req.body?.updates || {}; const allowed = ['platformFeeRate','minWithdrawal','minTopup','maxTopup','referralBonus','requireAdminApproval','campusVerificationRequired','announcement','announcementActive','maintenanceMode','maintenanceMessage','supportEmail','supportWhatsApp','featureFlags','emergencyLock','walletOpsPaused','trueConnectionEnabled','trueConnectionRequiresApproval'];
+    const patch = {}; for (const key of allowed) if (Object.prototype.hasOwnProperty.call(input,key)) patch[key] = input[key];
+    if (!Object.keys(patch).length) throw new Error('No supported V1 settings supplied.');
+    if (patch.platformFeeRate !== undefined && (!Number.isFinite(Number(patch.platformFeeRate)) || Number(patch.platformFeeRate)<0 || Number(patch.platformFeeRate)>1)) throw new Error('Platform fee rate must be between 0 and 1.');
+    if (patch.minTopup !== undefined && (!Number.isFinite(Number(patch.minTopup)) || Number(patch.minTopup)<0)) throw new Error('Minimum top-up is invalid.');
+    if (patch.maxTopup !== undefined && (!Number.isFinite(Number(patch.maxTopup)) || Number(patch.maxTopup)<0)) throw new Error('Maximum top-up is invalid.');
+    if (patch.minTopup !== undefined && patch.maxTopup !== undefined && Number(patch.maxTopup)<Number(patch.minTopup)) throw new Error('Maximum top-up cannot be lower than minimum top-up.');
+    for (const k of ['emergencyLock','walletOpsPaused','trueConnectionEnabled','trueConnectionRequiresApproval']) if (patch[k] !== undefined && typeof patch[k] !== 'boolean') throw new Error('Invalid value for ' + k + '.');
+    if (patch.featureFlags !== undefined) {
+      const flags = patch.featureFlags || {}; const allowedFlags = new Set(['earningHubEnabled','jobsEnabled','campusEnabled','aiEnabled','socialEnabled']);
+      if (Object.keys(flags).some(k => !allowedFlags.has(k) || typeof flags[k] !== 'boolean')) throw new Error('Only V1 feature flags are supported.');
+      patch.featureFlags = flags;
+    }
+    const before = (await db.ref('platformSettings').once('value')).val() || {};
+    await db.ref('platformSettings').update({...patch, updatedAt:Date.now(), updatedBy:actor.uid});
+    await writeAudit(actor, 'update_platform_settings', 'platformSettings', 'root', '', before, patch);
+    return res.json({ok:true});
+  } catch (e) { return adminResponseError(res, e); }
+});
+app.post('/api/admin/publish', async (req, res) => {
+  try {
+    const actor = await requireAdmin(req); if (actor.role !== 'super_admin') throw new Error('Forbidden');
+    const type = String(req.body?.type || ''); const p = req.body?.payload || {};
+    const title = String(p.title || '').trim().slice(0,120); if (title.length < 3) throw new Error('Enter a valid title.');
+    const now = Date.now(); let node, payload;
+    if (type === 'campaign') {
+      const reward=Number(p.reward), slots=Math.floor(Number(p.totalSlots));
+      if (!Number.isFinite(reward) || reward < 20 || !Number.isInteger(slots) || slots<1 || slots>100000) throw new Error('Invalid campaign reward or target slots.');
+      if (!/^https?:\/\//i.test(String(p.targetUrl||'')) || String(p.instructions||'').trim().length<20) throw new Error('Campaign URL or instructions are invalid.');
+      const required=reward*slots; const external=p.isExternalCustomerCampaign===true;
+      if (external && (String(p.customerName||'').trim().length<2 || Number(p.customerPaymentReceived)<required)) throw new Error('External customer payment must cover the complete campaign budget.');
+      node='campaigns'; payload={...p,title,creatorId:actor.uid,creatorName:actor.name,createdByAdmin:true,status:'active',createdAt:now,updatedAt:now,totalSlots:slots,reward,platformBudget:external?0:required,customerOutstanding:external?Math.max(0,required-Number(p.customerPaymentReceived)):0};
+    } else if (type === 'watch_ad') {
+      const reward=Number(p.rewardPerView), slots=Math.floor(Number(p.totalSlots));
+      if (!Number.isFinite(reward) || reward<10 || !Number.isInteger(slots) || slots<1 || slots>100000) throw new Error('Invalid sponsored ad reward or target viewers.');
+      if (!/^https?:\/\//i.test(String(p.videoUrl||'')) || !/^https?:\/\//i.test(String(p.actionLink||''))) throw new Error('Video and action links must be valid http(s) URLs.');
+      const required=reward*slots; const external=p.isExternalCustomerCampaign===true;
+      if (external && (String(p.customerName||'').trim().length<2 || Number(p.customerPaymentReceived)<required)) throw new Error('External customer payment must cover the complete ad budget.');
+      node='adminAds'; payload={...p,title,creatorId:actor.uid,creatorName:actor.name,createdByAdmin:true,status:'active',createdAt:now,updatedAt:now,totalSlots:slots,rewardPerView:reward,platformBudget:external?0:required,customerOutstanding:external?Math.max(0,required-Number(p.customerPaymentReceived)):0};
+    } else if (type === 'job') {
+      const budget=Number(p.budget); if (!Number.isFinite(budget)||budget<0 || String(p.description||'').trim().length<10 || String(p.location||'').trim().length<2) throw new Error('Job description, location or budget is invalid.');
+      node='jobs'; payload={...p,title,posterId:actor.uid,posterName:actor.name,createdByAdmin:true,status:'open',createdAt:now,updatedAt:now};
+    } else throw new Error('Only V1 campaigns, sponsored ads and jobs can be published here.');
+    const ref=db.ref(node).push(); payload.id=ref.key; await ref.set(payload);
+    await writeAudit(actor,'publish_v1_content',node,ref.key,'',null,{title,type});
+    return res.json({ok:true,id:ref.key,node});
+  } catch (e) { return adminResponseError(res, e); }
+});
+
+// True Connection server routes: matching, eligibility, requests and moderation are server-only.
+registerTrueConnection({ app, admin, db, authenticatedUid, requireAdmin, writeAudit });
+// V1 admin extras: user lookup/verify, verification (KYC) review, content moderation, mark-withdrawal-paid.
+registerAdminV1({ app, admin, db, requireAdmin, writeAudit, adminResponseError });
 app.get("/api/payment-config", async (req, res) => {
   const keys = paystackKeys();
   if (!keys.publicKey) return res.status(503).json({ error: `Paystack ${keys.mode} public key is not configured (it must start with pk_${keys.mode}_).` });
@@ -927,7 +1387,7 @@ app.post("/api/create-topup-intent", async (req, res) => {
     const keys = paystackKeys();
     if (!keys.publicKey || !keys.secretKey) return res.status(503).json({ error: `Paystack ${keys.mode} keys are not configured on the server.` });
     const user = await admin.auth().getUser(uid);
-    if (!user.email) return res.status(400).json({ error: "Add and verify an email address before funding your wallet." });
+    if (!user.email || !user.emailVerified) return res.status(403).json({ error: "Verify your email address before funding your wallet." });
     const reference = `mudy_${keys.mode}_${crypto.randomUUID()}`;
     await db.ref(`topupIntents/${uid}/${reference}`).set({ uid, amount, amountKobo: amount * 100, currency: "NGN", mode: keys.mode, status: "created", email: user.email, createdAt: admin.database.ServerValue.TIMESTAMP });
     return res.json({ reference, email: user.email, amount, mode: keys.mode });
@@ -998,7 +1458,9 @@ app.post("/api/withdraw", async (req, res) => {
     const userSnap = await userRef.once("value");
     const user = userSnap.val();
     if (!user) return res.status(404).json({ error: "User not found." });
-    if (user.banned === true || user.walletFrozen === true) return res.status(403).json({ error: "Your account or wallet is restricted. Contact support." });
+    const authUser = await admin.auth().getUser(uid);
+    if (!authUser.emailVerified) return res.status(403).json({ error: "Verify your email address before requesting a withdrawal." });
+    if (user.banned === true || user.status === 'banned' || user.walletFrozen === true) return res.status(403).json({ error: "Your account or wallet is restricted. Contact support." });
     if (!user.pinHash) return res.status(400).json({ error: "No wallet PIN set. Please set one in Settings." });
     const enteredHash = crypto.createHash("sha256").update(pin).digest("hex");
     if (enteredHash !== user.pinHash) return res.status(401).json({ error: "Incorrect Wallet PIN." });
@@ -1081,4 +1543,4 @@ app.listen(PORT, () => {
 });
 
 
-        
+
