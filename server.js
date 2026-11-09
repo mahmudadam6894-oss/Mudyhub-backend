@@ -6,9 +6,10 @@ import dotenv from 'dotenv';
 import registerTrueConnection from './true-connection-routes.js';
 import registerAdminV1 from './admin-v1-routes.js';
 import registerPromote from './promote-routes.js';
+import registerTasks from './tasks-routes.js';
 import {
   Document, Packer, Paragraph, TextRun, AlignmentType, ImageRun,
-  PageBreak, Footer, PageNumber
+  PageBreak, Footer, PageNumber, HeadingLevel, NumberFormat, TableOfContents
 } from 'docx';
 
 dotenv.config();
@@ -494,13 +495,71 @@ Write exactly 700 words. Ensure the conclusion sounds highly professional.`
   ];
 }
 
-async function generateChapter(prompt, maxTokens = 4000) {
+// -----------------------------------------------------
+// Every report gets its own "writing personality" so two students with identical answers
+// still receive clearly different reports.
+// -----------------------------------------------------
+const VAR_POOL = {
+  tone: [
+    "reflective and personal, as a student looking back on growth",
+    "practical and procedural, focusing on how things were done step by step",
+    "analytical, comparing classroom theory with what was seen on site",
+    "observant and descriptive, painting the workplace scene in detail",
+    "disciplined and formal, like a report written for a strict examiner"
+  ],
+  rhythm: [
+    "mostly medium-length sentences with an occasional very short one for emphasis",
+    "a mix of long explanatory sentences and brief clear statements",
+    "compact paragraphs of 4 to 5 sentences, each built around one clear point",
+    "flowing paragraphs that link each idea to the next with natural transitions"
+  ],
+  opening: [
+    "open each major section with a concrete observation or situation",
+    "open each major section with a short statement of its purpose",
+    "open each major section by connecting it to the previous section",
+    "open each major section with a question the student wanted answered"
+  ],
+  vocab: [
+    "prefer words like: exposure, hands-on, procedure, supervision, workflow, standard practice",
+    "prefer words like: familiarisation, competence, instruction, safety, routine, accuracy",
+    "prefer words like: involvement, guidance, application, workplace culture, efficiency, practice",
+    "prefer words like: orientation, responsibility, technique, coordination, quality, discipline"
+  ],
+  focus: [
+    "give extra weight to safety and workplace discipline",
+    "give extra weight to teamwork and communication with colleagues",
+    "give extra weight to the link between classroom theory and site practice",
+    "give extra weight to tools, equipment and measurable outcomes",
+    "give extra weight to time management and responsibility"
+  ]
+};
+function pickOne(arr) { return arr[crypto.randomInt(arr.length)]; }
+function buildVariation() {
+  return {
+    seed: crypto.randomBytes(6).toString('hex'),
+    tone: pickOne(VAR_POOL.tone), rhythm: pickOne(VAR_POOL.rhythm), opening: pickOne(VAR_POOL.opening),
+    vocab: pickOne(VAR_POOL.vocab), focus: pickOne(VAR_POOL.focus)
+  };
+}
+function variationBlock(v) {
+  return `
+UNIQUENESS ASSIGNMENT (report code ${v.seed}) — this report must read differently from any other report on the same topic:
+- Tone: ${v.tone}.
+- Sentence rhythm: ${v.rhythm}.
+- Structure: ${v.opening}.
+- Vocabulary: ${v.vocab}.
+- Emphasis: ${v.focus}.
+- Never reuse stock textbook sentences. Re-express every general fact (SIWES history, definitions, aims) in fresh wording and tie it to this student's course, organisation and own experience.
+- Include concrete, specific details from the student's answers (names, tools, dates, tasks) wherever possible.`;
+}
+
+async function generateChapter(prompt, maxTokens = 4000, variation = null) {
   return callGroq({
-    systemPrompt: `You are an expert Nigerian SIWES report writer. You write highly detailed, professional, and technical reports that read exactly like a real student wrote them. You follow the formatting rules strictly.`,
+    systemPrompt: `You are an expert Nigerian SIWES report writer. You write highly detailed, professional, and technical reports that read exactly like a real student wrote them. You follow the formatting rules strictly.${variation ? variationBlock(variation) : ''}`,
     messages: [{ role: "user", content: prompt }],
     model: MODELS.default,
     maxTokens: maxTokens,
-    temperature: 0.75
+    temperature: 0.9
   });
 }
 
@@ -588,13 +647,14 @@ function docxPara(text, opts = {}) {
   });
 }
 
-function docxHeading(text, level = 1) {
+function docxHeading(text, level = 1, inToc = false) {
   const sizes = { 1: 32, 2: 28, 3: 26 };
   return new Paragraph({
+    ...(inToc ? { heading: HeadingLevel.HEADING_1 } : {}),
     spacing: { before: 240, after: 200, line: 360 },
     alignment: AlignmentType.CENTER,
     children: [new TextRun({
-      text: text, bold: true,
+      text: text, bold: true, color: "000000",
       size: sizes[level] || 26,
       font: "Times New Roman"
     })]
@@ -603,9 +663,10 @@ function docxHeading(text, level = 1) {
 
 function docxSubheading(text) {
   return new Paragraph({
+    heading: HeadingLevel.HEADING_2,
     spacing: { before: 200, after: 160, line: 360 },
     children: [new TextRun({
-      text: text, bold: true, size: 26, font: "Times New Roman"
+      text: text, bold: true, color: "000000", size: 26, font: "Times New Roman"
     })]
   });
 }
@@ -667,6 +728,7 @@ app.post('/api/siwes', async (req, res) => {
     console.log(`[SIWES] Starting for uid=${uid}, org=${formData.orgName}, dept=${formData.dept}`);
 
     const prompts = buildChapterPrompts(formData);
+    const reportVariation = buildVariation();
     const chapters = [];
 
     for (const p of prompts) {
@@ -674,7 +736,7 @@ app.post('/api/siwes', async (req, res) => {
       
       // 🚨 FIXED: 20-25 Page Token Limits
       const maxTokensForChapter = p.chapterNum === 3 ? 3500 : 2000; 
-      const raw = await generateChapter(p.prompt, maxTokensForChapter); 
+      const raw = await generateChapter(p.prompt, maxTokensForChapter, reportVariation); 
       
       chapters.push({ num: p.chapterNum, title: p.title, text: stripMarkdown(raw) });
 
@@ -717,7 +779,15 @@ app.post('/api/siwes', async (req, res) => {
     // ===== DECLARATION =====
     children.push(docxHeading("DECLARATION", 1));
     children.push(docxPara(""));
-    children.push(docxPara(`I, ${formData.fullName || ""}, hereby declare that this SIWES technical report is my original work and has not been submitted elsewhere. It documents the industrial training I undertook at ${formData.orgName || "the organisation"} from ${formData.startDate || ""} to ${formData.endDate || ""}.`));
+    {
+      const nm = formData.fullName || "", org = formData.orgName || "the organisation";
+      const decls = [
+        `I, ${nm}, hereby declare that this SIWES technical report is my original work and has not been submitted elsewhere. It documents the industrial training I undertook at ${org} from ${formData.startDate || ""} to ${formData.endDate || ""}.`,
+        `I, ${nm}, declare that the contents of this technical report are a true account of my Student Industrial Work Experience Scheme (SIWES) training at ${org} between ${formData.startDate || ""} and ${formData.endDate || ""}, and that this work has not been presented to any other institution for any award.`,
+        `This is to declare that I, ${nm}, prepared this report from my own industrial training experience at ${org} during the period ${formData.startDate || ""} to ${formData.endDate || ""}. To the best of my knowledge, it has not been submitted for assessment elsewhere.`
+      ];
+      children.push(docxPara(pickOne(decls)));
+    }
     children.push(docxPara(""));
     children.push(docxPara(""));
     children.push(docxPara("_________________________________"));
@@ -746,62 +816,41 @@ app.post('/api/siwes', async (req, res) => {
     // ===== DEDICATION =====
     children.push(docxHeading("DEDICATION", 1));
     children.push(docxPara(""));
-    children.push(docxPara("This report is dedicated to Almighty Allah, to my family for their unwavering support throughout my academic journey, and to everyone who contributed to the success of my SIWES attachment."));
+    children.push(docxPara(pickOne([
+      "This report is dedicated to Almighty Allah, to my family for their unwavering support throughout my academic journey, and to everyone who contributed to the success of my SIWES attachment.",
+      "I dedicate this work to Almighty Allah for the strength and good health granted to me, and to my parents and well-wishers whose prayers and encouragement carried me through this training.",
+      "This report is dedicated to my family, my lecturers and everyone who believed in me during my industrial attachment and my studies."
+    ])));
     children.push(docxPageBreak());
 
     // ===== ACKNOWLEDGEMENT =====
     children.push(docxHeading("ACKNOWLEDGEMENT", 1));
     children.push(docxPara(""));
-    children.push(docxPara(`I sincerely appreciate the management and staff of ${formData.orgName || "the organisation"} for giving me the opportunity to undertake my industrial training with them. My special thanks go to ${formData.supervisorName || "my industry supervisor"} for the guidance, patience, and practical mentorship throughout the attachment period.`));
-    children.push(docxPara(""));
-    children.push(docxPara(`I also appreciate the management and lecturers of ${formData.institution || "Nuhu Bamalli Polytechnic, Zaria"}, particularly the Department of ${formData.dept || "my department"} and my school supervisor, for facilitating this SIWES programme.`));
+    {
+      const org = formData.orgName || "the organisation", sup = formData.supervisorName || "my industry supervisor";
+      const inst = formData.institution || "Nuhu Bamalli Polytechnic, Zaria";
+      children.push(docxPara(pickOne([
+        `I sincerely appreciate the management and staff of ${org} for giving me the opportunity to undertake my industrial training with them. My special thanks go to ${sup} for the guidance, patience, and practical mentorship throughout the attachment period.`,
+        `My deepest gratitude goes to the management and staff of ${org} for accepting me for my industrial training. I am especially thankful to ${sup}, whose supervision and encouragement shaped my experience throughout the attachment.`,
+        `I thank the management and staff of ${org} for the warm reception and the chance to learn on the job. I owe particular thanks to ${sup} for the time, instruction and support given to me during the programme.`
+      ])));
+      children.push(docxPara(""));
+      children.push(docxPara(pickOne([
+        `I also appreciate the management and lecturers of ${inst}, particularly the Department of ${formData.dept || "my department"}, for preparing me academically and for supervising my progress during the programme.`,
+        `I am grateful to ${inst} and the Department of ${formData.dept || "my department"}, including my school supervisor, for the academic foundation and the follow-up visits that supported my training.`
+      ])));
+    }
     children.push(docxPara(""));
     children.push(docxPara("Finally, my gratitude goes to my family and friends for their encouragement and support throughout the programme."));
     children.push(docxPageBreak());
 
+    const idxB = children.length;   // section B starts here (Roman numerals)
     // ===== TABLE OF CONTENTS =====
     children.push(docxHeading("TABLE OF CONTENTS", 1));
     children.push(docxPara(""));
-    const toc = [
-      "Title Page .................................................. i",
-      "Declaration ................................................. ii",
-      "Certification ............................................... iii",
-      "Dedication .................................................. iv",
-      "Acknowledgement ............................................. v",
-      "Table of Contents ........................................... vi",
-      "List of Figures ............................................. vii",
-      "List of Tables .............................................. viii",
-      "Abstract .................................................... ix",
-      "",
-      "CHAPTER ONE: INTRODUCTION TO SIWES",
-      "    a. Definition of SIWES ................................... 1",
-      "    b. Brief History of SIWES ................................ 2",
-      "    c. Importance / Purpose of SIWES ......................... 4",
-      "    d. Aim and Objectives of SIWES ........................... 6",
-      "    e. Bodies Involved in the Management of SIWES ........... 7",
-      "",
-      `CHAPTER TWO: ${(formData.orgName || "ORGANISATION PROFILE").toUpperCase()}`,
-      "    a. Brief History of the Organisation ..................... 9",
-      "    b. Mission of the Organisation ........................... 11",
-      "    c. Vision of the Organisation ............................ 12",
-      "    d. Organisational Chart .................................. 13",
-      "    e. Roles Performed by the Organisation ................... 14",
-      "",
-      "CHAPTER THREE: PRACTICAL EXPERIENCE",
-      "    a. Experience Acquired in the Organisation ............... 17",
-      "    b. Summary of Work Undertaken ............................ 25",
-      "",
-      "CHAPTER FOUR: PROBLEMS, CHALLENGES AND SOLUTIONS",
-      "    a. Problems / Challenges Faced ........................... 28",
-      "    b. Solutions to the Problems ............................. 30",
-      "",
-      "CHAPTER FIVE: SUMMARY, CONCLUSION AND RECOMMENDATION",
-      "    a. Summary ............................................... 32",
-      "    b. Conclusion ............................................ 33",
-      "    c. Recommendation ........................................ 34",
-      "    d. References ............................................ 35"
-    ];
-    toc.forEach(line => children.push(docxPara(line, { size: 22, afterSpacing: 60 })));
+    // Real Word table of contents: it lists the real headings with real page numbers
+    // (Word asks once to update fields when the file is opened).
+    children.push(new TableOfContents("Table of Contents", { hyperlink: true, headingStyleRange: "1-2" }));
     children.push(docxPageBreak());
 
     // ===== LIST OF FIGURES =====
@@ -826,16 +875,17 @@ app.post('/api/siwes', async (req, res) => {
     children.push(docxPageBreak());
 
     // ===== ABSTRACT =====
-    children.push(docxHeading("ABSTRACT", 1));
+    children.push(docxHeading("ABSTRACT", 1, true));
     children.push(docxPara(""));
     children.push(docxPara(
       `\nThis report presents a detailed account of the Student Industrial Work Experience Scheme (SIWES) attachment undertaken by ${formData.fullName || "the student"} at ${formData.orgName || "an organisation"} from ${formData.startDate || ""} to ${formData.endDate || ""}, as part of the ${formData.level || "ND II"} ${formData.dept || "programme"} at ${formData.institution || "Nuhu Bamalli Polytechnic, Zaria"}. During the attachment, the student worked in the ${formData.orgUnit || "relevant"} unit as a ${formData.jobRole || "student intern"}. The report covers the organisation's profile, the practical experience acquired, the projects handled, the technical and interpersonal challenges encountered, and the lessons learned. The SIWES programme provided invaluable practical exposure that complemented the theoretical knowledge gained in the classroom and significantly enhanced the student's technical and soft skills.`
     ));
     children.push(docxPageBreak());
 
+    const idxC = children.length;   // section C starts here (Chapter 1, page 1)
     // ===== CHAPTERS =====
     for (const ch of chapters) {
-      children.push(docxHeading(ch.title, 1));
+      children.push(docxHeading(ch.title, 1, true));
       children.push(docxPara(""));
 
       if (images) {
@@ -905,35 +955,38 @@ app.post('/api/siwes', async (req, res) => {
       children.push(docxPageBreak());
     }
      // ===== PACK AND SEND =====
+    const pageMargin = { top: 1440, right: 1440, bottom: 1440, left: 1440 };
+    const numberFooter = () => new Footer({
+      children: [new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new TextRun({ children: [PageNumber.CURRENT], font: "Times New Roman", size: 24 })]
+      })]
+    });
+    // Drop the trailing page break of each part: a new section already starts on a new page.
+    const partA = children.slice(0, idxB - 1);
+    const partB = children.slice(idxB, idxC - 1);
+    const partC = children.slice(idxC, children.length - 1);
+
     const doc = new Document({
       creator: formData.fullName || "MudyHub Student",
       title: "SIWES Technical Report",
-      sections: [{
-        properties: {
-          page: {
-            margin: { top: 1440, right: 1440, bottom: 1440, left: 1440 }
-          }
-        },
-        // ✅ ADDED: Page Numbers in Footer
-        footers: {
-          default: new Footer({
-            children: [
-              new Paragraph({
-                alignment: AlignmentType.CENTER,
-                children: [
-                  new TextRun({
-                    children: ["Page ", PageNumber.CURRENT],
-                    font: "Times New Roman",
-                    size: 24, 
-                    color: "666666" 
-                  }),
-                ],
-              }),
-            ],
-          }),
-        },
-        children
-      }]
+      features: { updateFields: true },
+      styles: {
+        default: {
+          heading1: { run: { font: "Times New Roman", size: 32, bold: true, color: "000000" }, paragraph: { alignment: AlignmentType.CENTER } },
+          heading2: { run: { font: "Times New Roman", size: 26, bold: true, color: "000000" } }
+        }
+      },
+      sections: [
+        // A: title page, declaration, certification, dedication, acknowledgement — no page numbers
+        { properties: { page: { margin: pageMargin } }, children: partA },
+        // B: contents pages — Roman numerals starting at i
+        { properties: { page: { margin: pageMargin, pageNumbers: { start: 1, formatType: NumberFormat.LOWER_ROMAN } } },
+          footers: { default: numberFooter() }, children: partB },
+        // C: Chapter One to the end — Arabic numerals starting at 1
+        { properties: { page: { margin: pageMargin, pageNumbers: { start: 1, formatType: NumberFormat.DECIMAL } } },
+          footers: { default: numberFooter() }, children: partC }
+      ]
     });
 
     const buffer = await Packer.toBuffer(doc);
@@ -1155,6 +1208,15 @@ app.post('/api/admin/task/review', async (req, res) => {
     if (item.status === 'approved' || item.status === 'rejected') throw new Error('This submission has already been reviewed.');
     const uid = String(item.userId || item.uid || ''); if (!uid) throw new Error('Submission has no user ID.');
     if (decision === 'reject') {
+      // Give the slot back (once) and let the user try again.
+      if (item.slotReserved === true && item.campaignId && ['campaigns','adminCreatedTasks','adminAds'].includes(item.srcNode)) {
+        const rel = await db.ref(`slotReleases/${id}`).transaction(cur => cur ? undefined : { at: Date.now() });
+        if (rel.committed) {
+          const field = item.srcNode === 'adminAds' ? 'viewsCompleted' : 'completedSlots';
+          await db.ref(`${item.srcNode}/${item.campaignId}/${field}`).transaction(cur => Math.max(0, Number(cur || 0) - 1));
+          await db.ref(`taskClaims/${item.campaignId}/${uid}`).remove();
+        }
+      }
       await itemRef.update({ status: 'rejected', rejectionReason: reason || 'Submission did not meet the task requirements.', reviewedAt: Date.now(), reviewedBy: actor.uid });
       await db.ref(`notifications/${uid}`).push({ type:'task_rejected', message:`Your task submission was rejected. Reason: ${reason || 'Submission did not meet the task requirements.'}`, createdAt:Date.now(), read:false });
       await writeAudit(actor, 'reject_task_submission', 'submission', id, reason, {status:item.status}, {status:'rejected'});
@@ -1172,28 +1234,6 @@ app.post('/api/admin/task/review', async (req, res) => {
       }
     }
     if (!Number.isFinite(gross) || gross <= 0 || gross > 1000000) throw new Error('Invalid task reward amount.');
-    // Use up one slot for this task (exactly once per submission, never past the limit).
-    if (srcNode) {
-      const counterField = srcNode === 'adminAds' ? 'viewsCompleted' : 'completedSlots';
-      const totalSlots = Number(srcData.totalSlots || 0);
-      const claim = await db.ref(`slotClaims/${sourceId}/${id}`).transaction(cur => cur ? undefined : { at: Date.now(), by: actor.uid });
-      if (claim.committed) {
-        let full = false;
-        const counter = await db.ref(`${srcNode}/${sourceId}/${counterField}`).transaction(cur => {
-          full = false;
-          const n = Number(cur || 0);
-          if (totalSlots > 0 && n >= totalSlots) { full = true; return; }
-          return n + 1;
-        });
-        if (!counter.committed || full) {
-          await db.ref(`slotClaims/${sourceId}/${id}`).remove().catch(() => {});
-          throw new Error('All slots for this task are already filled. Reject this submission or ask the creator to add slots.');
-        }
-        if (totalSlots > 0 && Number(counter.snapshot.val()) >= totalSlots) {
-          await db.ref(`${srcNode}/${sourceId}`).update({ status: 'completed', completedAt: Date.now() }).catch(() => {});
-        }
-      }
-    }
     const settings = (await db.ref('platformSettings').once('value')).val() || {};
     const rate = Math.min(1, Math.max(0, Number(settings.platformFeeRate ?? 0.20)));
     const calculatedFee = Math.round(gross * rate * 100) / 100;
@@ -1398,6 +1438,7 @@ registerTrueConnection({ app, admin, db, authenticatedUid, requireAdmin, writeAu
 // V1 admin extras: user lookup/verify, verification (KYC) review, content moderation, mark-withdrawal-paid.
 registerAdminV1({ app, admin, db, requireAdmin, writeAudit, adminResponseError });
 registerPromote({ app, admin, db, authenticatedUid });
+registerTasks({ app, admin, db, authenticatedUid });
 app.get("/api/payment-config", async (req, res) => {
   const keys = paystackKeys();
   if (!keys.publicKey) return res.status(503).json({ error: `Paystack ${keys.mode} public key is not configured (it must start with pk_${keys.mode}_).` });
