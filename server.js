@@ -1163,14 +1163,37 @@ app.post('/api/admin/task/review', async (req, res) => {
     // Never trust a reward typed into the browser: take it from the campaign/task record when one exists.
     let gross = Number(item.rewardAmount || 0);
     const sourceId = String(item.campaignId || '').trim();
+    let srcNode = null, srcData = null;
     if (sourceId && !/[.#$\[\]\/]/.test(sourceId)) {
-      for (const node of ['campaigns', 'adminCreatedTasks']) {
+      for (const node of ['campaigns', 'adminCreatedTasks', 'adminAds']) {
         const src = (await db.ref(`${node}/${sourceId}`).once('value')).val();
-        const trusted = src ? Number(src.reward ?? src.rewardPerAction ?? 0) : 0;
-        if (Number.isFinite(trusted) && trusted > 0) { gross = trusted; break; }
+        const trusted = src ? Number(src.reward ?? src.rewardPerAction ?? src.rewardPerView ?? 0) : 0;
+        if (Number.isFinite(trusted) && trusted > 0) { gross = trusted; srcNode = node; srcData = src; break; }
       }
     }
     if (!Number.isFinite(gross) || gross <= 0 || gross > 1000000) throw new Error('Invalid task reward amount.');
+    // Use up one slot for this task (exactly once per submission, never past the limit).
+    if (srcNode) {
+      const counterField = srcNode === 'adminAds' ? 'viewsCompleted' : 'completedSlots';
+      const totalSlots = Number(srcData.totalSlots || 0);
+      const claim = await db.ref(`slotClaims/${sourceId}/${id}`).transaction(cur => cur ? undefined : { at: Date.now(), by: actor.uid });
+      if (claim.committed) {
+        let full = false;
+        const counter = await db.ref(`${srcNode}/${sourceId}/${counterField}`).transaction(cur => {
+          full = false;
+          const n = Number(cur || 0);
+          if (totalSlots > 0 && n >= totalSlots) { full = true; return; }
+          return n + 1;
+        });
+        if (!counter.committed || full) {
+          await db.ref(`slotClaims/${sourceId}/${id}`).remove().catch(() => {});
+          throw new Error('All slots for this task are already filled. Reject this submission or ask the creator to add slots.');
+        }
+        if (totalSlots > 0 && Number(counter.snapshot.val()) >= totalSlots) {
+          await db.ref(`${srcNode}/${sourceId}`).update({ status: 'completed', completedAt: Date.now() }).catch(() => {});
+        }
+      }
+    }
     const settings = (await db.ref('platformSettings').once('value')).val() || {};
     const rate = Math.min(1, Math.max(0, Number(settings.platformFeeRate ?? 0.20)));
     const calculatedFee = Math.round(gross * rate * 100) / 100;
