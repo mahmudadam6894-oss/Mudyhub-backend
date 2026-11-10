@@ -140,41 +140,57 @@ async function callGroq({ systemPrompt, messages, model, jsonMode = false, maxTo
   if (!process.env.GROQ_API_KEY) {
     throw new Error("GROQ_API_KEY is not set in Render Environment Variables.");
   }
+  const useModel = model || MODELS.default;
+  const isReasoningModel = /gpt-oss|qwen3|deepseek-r1/i.test(useModel);
+  let tokens = maxTokens;
 
-  const body = {
-    model: model || MODELS.default,
-    messages: [{ role: "system", content: systemPrompt }, ...messages],
-    temperature,
-    max_tokens: maxTokens
-  };
+  // Reasoning models spend part of max_tokens "thinking". If that uses the whole budget the visible
+  // answer comes back empty, so keep the thinking short and retry once with a bigger budget.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const body = {
+      model: useModel,
+      messages: [{ role: "system", content: systemPrompt }, ...messages],
+      temperature,
+      max_tokens: tokens
+    };
+    if (/gpt-oss/i.test(useModel)) body.reasoning_effort = "low";
+    if (jsonMode) body.response_format = { type: "json_object" };
 
-  if (jsonMode) body.response_format = { type: "json_object" };
+    const response = await fetch(GROQ_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`
+      },
+      body: JSON.stringify(body)
+    });
 
-  const response = await fetch(GROQ_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${process.env.GROQ_API_KEY}`
-    },
-    body: JSON.stringify(body)
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    let errMessage = `Groq API error (${response.status})`;
-    try {
-      const parsed = JSON.parse(errText);
-      errMessage = parsed.error?.message || errMessage;
-    } catch (e) {
-      errMessage = errText || errMessage;
+    if (!response.ok) {
+      const errText = await response.text();
+      let errMessage = `Groq API error (${response.status})`;
+      try {
+        const parsed = JSON.parse(errText);
+        errMessage = parsed.error?.message || errMessage;
+      } catch (e) {
+        errMessage = errText || errMessage;
+      }
+      // Rate limit or temporary overload: wait and retry.
+      if ((response.status === 429 || response.status >= 500) && attempt < 3) {
+        await new Promise(r => setTimeout(r, 4000 * attempt));
+        continue;
+      }
+      throw new Error(errMessage);
     }
-    throw new Error(errMessage);
-  }
 
-  const data = await response.json();
-  const text = data.choices?.[0]?.message?.content;
-  if (!text) throw new Error("Groq returned an empty response.");
-  return text;
+    const data = await response.json();
+    const text = data.choices?.[0]?.message?.content;
+    if (text && String(text).trim()) return text;
+    if (attempt < 3) {
+      tokens = Math.min(Math.round(tokens * 1.7) + (isReasoningModel ? 1500 : 0), 16000);
+      continue;
+    }
+  }
+  throw new Error("Groq returned an empty response.");
 }
 
 // -----------------------------------------------------
