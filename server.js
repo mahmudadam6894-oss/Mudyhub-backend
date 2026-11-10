@@ -9,8 +9,10 @@ import registerPromote from './promote-routes.js';
 import registerTasks from './tasks-routes.js';
 import {
   Document, Packer, Paragraph, TextRun, AlignmentType, ImageRun,
-  PageBreak, Footer, PageNumber, HeadingLevel, NumberFormat, TableOfContents
+  PageBreak, Footer, PageNumber, HeadingLevel, NumberFormat, TableOfContents, TabStopType, LeaderType
 } from 'docx';
+let JSZipLib = null;
+try { JSZipLib = (await import('jszip')).default; } catch (_) { console.warn('[SIWES] jszip not found: contents page will use fixed page numbers.'); }
 
 dotenv.config();
 const app = express();
@@ -136,6 +138,29 @@ If asked something unrelated to MudyHub, earning, or learning, redirect politely
 // -----------------------------------------------------
 // CORE GROQ CALLER
 // -----------------------------------------------------
+// ---- Token pacing: Groq limits tokens per minute for the whole organisation (8,000 on the free tier).
+// Every call reserves its estimated tokens first and waits if the last 60 seconds are already full.
+// Set GROQ_TPM_LIMIT in Render if you upgrade your Groq plan.
+const GROQ_TPM_LIMIT = Number(process.env.GROQ_TPM_LIMIT || 8000);
+const tokenLog = [];
+let limiterChain = Promise.resolve();
+const sleepMs = ms => new Promise(r => setTimeout(r, ms));
+function reserveTokens(estimate) {
+  const n = Math.min(Math.max(1, Math.round(estimate)), Math.floor(GROQ_TPM_LIMIT * 0.9));
+  const p = limiterChain.then(async () => {
+    for (;;) {
+      const now = Date.now();
+      while (tokenLog.length && now - tokenLog[0].t > 60000) tokenLog.shift();
+      const used = tokenLog.reduce((a, x) => a + x.n, 0);
+      if (used + n <= GROQ_TPM_LIMIT * 0.92) { const entry = { t: now, n }; tokenLog.push(entry); return entry; }
+      const wait = tokenLog.length ? 60000 - (now - tokenLog[0].t) + 300 : 1000;
+      await sleepMs(Math.min(Math.max(wait, 500), 15000));
+    }
+  });
+  limiterChain = p.catch(() => {});
+  return p;
+}
+
 async function callGroq({ systemPrompt, messages, model, jsonMode = false, maxTokens = 1024, temperature = 0.7 }) {
   if (!process.env.GROQ_API_KEY) {
     throw new Error("GROQ_API_KEY is not set in Render Environment Variables.");
@@ -143,10 +168,12 @@ async function callGroq({ systemPrompt, messages, model, jsonMode = false, maxTo
   const useModel = model || MODELS.default;
   const isReasoningModel = /gpt-oss|qwen3|deepseek-r1/i.test(useModel);
   let tokens = maxTokens;
+  const inputTokens = Math.ceil((String(systemPrompt || '').length + JSON.stringify(messages || []).length) / 3.2);
 
   // Reasoning models spend part of max_tokens "thinking". If that uses the whole budget the visible
-  // answer comes back empty, so keep the thinking short and retry once with a bigger budget.
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  // answer comes back empty, so keep the thinking short and retry with a bigger budget.
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const entry = await reserveTokens(inputTokens + tokens);
     const body = {
       model: useModel,
       messages: [{ role: "system", content: systemPrompt }, ...messages],
@@ -174,19 +201,23 @@ async function callGroq({ systemPrompt, messages, model, jsonMode = false, maxTo
       } catch (e) {
         errMessage = errText || errMessage;
       }
-      // Rate limit or temporary overload: wait and retry.
-      if ((response.status === 429 || response.status >= 500) && attempt < 3) {
-        await new Promise(r => setTimeout(r, 4000 * attempt));
+      if ((response.status === 429 || response.status >= 500) && attempt < 5) {
+        // Honour Groq's own "try again in ..." hint, otherwise back off.
+        const hint = /try again in ([\d.]+)\s*(ms|s)/i.exec(errMessage);
+        let wait = hint ? (hint[2].toLowerCase() === 'ms' ? Number(hint[1]) : Number(hint[1]) * 1000) + 800 : 4000 * attempt;
+        if (response.status === 429) entry.n = Math.floor(GROQ_TPM_LIMIT * 0.9);   // treat the window as full
+        await sleepMs(Math.min(wait, 20000));
         continue;
       }
       throw new Error(errMessage);
     }
 
     const data = await response.json();
+    if (data.usage?.total_tokens) entry.n = data.usage.total_tokens;   // record what was really used
     const text = data.choices?.[0]?.message?.content;
     if (text && String(text).trim()) return text;
-    if (attempt < 3) {
-      tokens = Math.min(Math.round(tokens * 1.7) + (isReasoningModel ? 1500 : 0), 16000);
+    if (attempt < 5) {
+      tokens = Math.min(Math.round(tokens * 1.6) + (isReasoningModel ? 1500 : 0), 7000);
       continue;
     }
   }
@@ -373,13 +404,106 @@ const STUDENT_VOICE_RULE = `
 CRITICAL WRITING RULES:
 1. Write like a real Nigerian polytechnic student who paid attention during their attachment, not like a textbook or an AI.
 2. Use SIMPLE, CLEAR sentences. Mix short and medium sentences. Start sentences with "I", "We", "My supervisor", "During my time", "I was shown", "I learned", "I observed".
-3. FORMATTING: You may use **bold** for key terms or sub-headings. You may use dashes (-) for lists. NEVER use hashtags (#), asterisks for headers (***), or code blocks.
+3. FORMATTING: Write plain paragraphs. Do NOT use bold, italics or asterisks anywhere. Use a dash (-) only for a genuine list. NEVER use hashtags (#) or code blocks. Do not repeat the chapter title.
 4. DO NOT HALLUCINATE COMPANY NAMES. You must ONLY use the exact organisation name provided in the context. Never invent names like "ABC Manufacturing" or "Delta Engineering".
 5. AUTOMATIC FILLING: If the student leaves a field empty, YOU MUST INVENT highly realistic, professional details relevant to their department (e.g., if Mechanical, mention lathe machines, micrometers, CNC; if Electrical, mention multimeters, wiring). The report must be 100% complete.
 6. Write in the PAST TENSE.
 7. DO NOT start with "Certainly" or "Here is". Start directly with the content.
 8. You must write detailed paragraphs to ensure the final document is between 20 to 25 pages when printed. Do not write excessively long chapters; follow the word count instructions exactly.
 `;
+
+// -----------------------------------------------------
+// Official chapter headings (from the SIWES writing guide) and a page-number estimate for the contents page.
+// -----------------------------------------------------
+const OFFICIAL_HEADINGS = {
+  1: [[/definition/i, 'Definition of SIWES'], [/history/i, 'Brief History of SIWES'], [/importance|purpose/i, 'Importance / Purpose of SIWES'],
+      [/aim|objective/i, 'Aim and Objectives of SIWES'], [/bodies|managem/i, 'Bodies Involved in the Management of SIWES and Their Roles']],
+  2: [[/history/i, 'Brief History of the Organisation'], [/mission/i, 'Mission of the Organisation'], [/vision/i, 'Vision of the Organisation'],
+      [/chart|organogram|structure/i, 'Organisational Chart'], [/roles?\b|performed/i, 'Roles Performed by the Organisation']],
+  3: [[/experience|acquired/i, 'Experience Acquired in the Organisation'], [/summary|vivid|undertaken/i, 'Summary of Work Undertaken in the Organisation']],
+  4: [[/^(?!.*solution).*(problem|challenge)/i, 'Problems / Challenges Faced in the Organisation'], [/solution/i, 'Solutions to the Problems / Challenges Faced']],
+  5: [[/summary/i, 'Summary'], [/conclusion/i, 'Conclusion'], [/recommend/i, 'Recommendation']]
+};
+function applyOfficialHeadings(chNum, items) {
+  const list = OFFICIAL_HEADINGS[chNum] || [];
+  const used = new Set();
+  return items.map(it => {
+    if (it.type !== 'subheading') return it;
+    const bare = it.text.replace(/\*\*/g, '').replace(/^[a-eA-E][.)]\s*/, '').trim();
+    const idx = list.findIndex(([re], i) => !used.has(i) && re.test(bare));
+    if (idx === -1) return { type: 'minor', text: bare };
+    used.add(idx);
+    return { type: 'official', text: `${String.fromCharCode(97 + idx)}. ${list[idx][1]}` };
+  });
+}
+function toRoman(n) {
+  const map = [[10, 'x'], [9, 'ix'], [5, 'v'], [4, 'iv'], [1, 'i']];
+  let out = '';
+  for (const [v, s] of map) while (n >= v) { out += s; n -= v; }
+  return out;
+}
+// Calibrated against real renders (12pt Times New Roman, 1.5 line spacing, 1-inch margins).
+const PAGE_MODEL = { cpl: 86, lpp: 34, gap: 0, head: 0.8, title: 2.2 };
+function estimateLayout(chapters, images) {
+  const { cpl, lpp, gap, head, title } = PAGE_MODEL;
+  let page = 1;
+  const out = [];
+  for (const ch of chapters) {
+    let lines = title;
+    if (ch.num === 2 && images?.logo?.data) lines += 8;
+    if (ch.num === 3) lines += 12.6 * [images?.work1, images?.work2, images?.work3, images?.project1, images?.project2].filter(i => i?.data).length;
+    const subs = [];
+    for (const it of ch.items) {
+      if (it.type === 'official') { subs.push({ text: it.text, page: page + Math.floor(lines / lpp) }); lines += head; }
+      else if (it.type === 'minor') lines += head;
+      else if (it.type === 'bullet') lines += Math.ceil(it.text.length / (cpl - 6));
+      else lines += Math.ceil(it.text.length / cpl) + gap;
+    }
+    if (ch.num === 5) { subs.push({ text: 'd. References', page: page + Math.floor(lines / lpp) }); lines += head + 12; }
+    const pages = Math.max(1, Math.ceil(lines / lpp));
+    out.push({ num: ch.num, title: ch.title, startPage: page, pages, subs });
+    page += pages;
+  }
+  return out;
+}
+function buildTocEntries(layout, images, tocPagesGuess = 1) {
+  let r = tocPagesGuess;                 // roman numbering: contents page is i
+  const lofPage = toRoman(1 + r), lotPage = toRoman(2 + r), absPage = toRoman(3 + r);
+  const entries = [
+    { text: 'List of Figures', page: lofPage, level: 1 },
+    { text: 'List of Tables', page: lotPage, level: 1 },
+    { text: 'Abstract', page: absPage, level: 1 }
+  ];
+  for (const ch of layout) {
+    entries.push({ text: ch.title, page: String(ch.startPage), level: 1 });
+    for (const s of ch.subs) entries.push({ text: s.text, page: String(s.page), level: 2 });
+  }
+  return entries;
+}
+function xmlEsc(t) { return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+// A real Word TOC field that already contains its entries, so phones/WPS/LibreOffice show it too.
+function tocSdtXml(entries) {
+  const rpr = b => `<w:rPr><w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman" w:cs="Times New Roman"/>${b ? '<w:b/>' : ''}<w:sz w:val="${b ? 24 : 22}"/></w:rPr>`;
+  const paras = entries.map((e, i) => {
+    const first = i === 0, last = i === entries.length - 1, b = e.level === 1;
+    const ppr = `<w:pPr><w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9350"/></w:tabs><w:spacing w:before="${b ? 120 : 0}" w:after="60" w:line="288" w:lineRule="auto"/>${b ? '' : '<w:ind w:left="360"/>'}</w:pPr>`;
+    const begin = first ? '<w:r><w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \\h \\o "1-2" </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>' : '';
+    const end = last ? '<w:r><w:fldChar w:fldCharType="end"/></w:r>' : '';
+    return `<w:p>${ppr}${begin}<w:r>${rpr(b)}<w:t xml:space="preserve">${xmlEsc(e.text)}</w:t></w:r><w:r>${rpr(b)}<w:tab/></w:r><w:r>${rpr(b)}<w:t>${xmlEsc(e.page)}</w:t></w:r>${end}</w:p>`;
+  }).join('');
+  return `<w:sdt><w:sdtPr><w:alias w:val="Table of Contents"/></w:sdtPr><w:sdtContent>${paras}</w:sdtContent></w:sdt>`;
+}
+function staticTocParagraphs(entries) {
+  return entries.map(e => new Paragraph({
+    tabStops: [{ type: TabStopType.RIGHT, position: 9350, leader: LeaderType.DOT }],
+    spacing: { before: e.level === 1 ? 120 : 0, after: 60, line: 288 },
+    indent: e.level === 2 ? { left: 360 } : undefined,
+    children: [
+      new TextRun({ text: e.text, bold: e.level === 1, font: 'Times New Roman', size: e.level === 1 ? 24 : 22 }),
+      new TextRun({ text: '\t' + e.page, bold: e.level === 1, font: 'Times New Roman', size: e.level === 1 ? 24 : 22 })
+    ]
+  }));
+}
 
 // -----------------------------------------------------
 // Report data clean-up and the "fact sheet" that keeps all five chapters consistent
@@ -450,7 +574,7 @@ Invent realistic supporting details that fit a small-to-medium Nigerian organisa
 "equipment" (array of 6-8 equipment/tools that really exist in this kind of workplace),
 "monthlyFocus" (array with one short sentence per training month in this list: ${span ? span.monthList.join(' | ') : 'month 1 | month 2 | month 3 | month 4'}),
 "projectIdea" (one realistic, modest project a student could take part in).` }],
-      model: MODELS.default, jsonMode: true, maxTokens: 1500, temperature: 0.7
+      model: MODELS.default, jsonMode: true, maxTokens: 900, temperature: 0.7
     });
     const bible = JSON.parse(String(bibleRaw).replace(/```json|```/g, '').trim());
     if (Number.isInteger(bible.founded)) { foundedYear = bible.founded; allowedYears.add(foundedYear); }
@@ -676,12 +800,6 @@ const VAR_POOL = {
     "open each major section by connecting it to the previous section",
     "open each major section with a question the student wanted answered"
   ],
-  vocab: [
-    "prefer words like: exposure, hands-on, procedure, supervision, workflow, standard practice",
-    "prefer words like: familiarisation, competence, instruction, safety, routine, accuracy",
-    "prefer words like: involvement, guidance, application, workplace culture, efficiency, practice",
-    "prefer words like: orientation, responsibility, technique, coordination, quality, discipline"
-  ],
   focus: [
     "give extra weight to safety and workplace discipline",
     "give extra weight to teamwork and communication with colleagues",
@@ -695,7 +813,7 @@ function buildVariation() {
   return {
     seed: crypto.randomBytes(6).toString('hex'),
     tone: pickOne(VAR_POOL.tone), rhythm: pickOne(VAR_POOL.rhythm), opening: pickOne(VAR_POOL.opening),
-    vocab: pickOne(VAR_POOL.vocab), focus: pickOne(VAR_POOL.focus)
+    focus: pickOne(VAR_POOL.focus)
   };
 }
 function variationBlock(v) {
@@ -704,9 +822,8 @@ UNIQUENESS ASSIGNMENT (report code ${v.seed}) — this report must read differen
 - Tone: ${v.tone}.
 - Sentence rhythm: ${v.rhythm}.
 - Structure: ${v.opening}.
-- Vocabulary: ${v.vocab}.
 - Emphasis: ${v.focus}.
-- Never reuse stock textbook sentences. Re-express every general fact (SIWES history, definitions, aims) in fresh wording and tie it to this student's course, organisation and own experience.
+- Do not overuse the words safety, discipline, routine, competence, familiarisation or instruction: use each at most a few times in the whole chapter and vary your wording. Never reuse stock textbook sentences. Re-express every general fact (SIWES history, definitions, aims) in fresh wording and tie it to this student's course, organisation and own experience.
 - Include concrete, specific details from the student's answers (names, tools, dates, tasks) wherever possible.
 ${v.facts || ''}
 TECHNICAL ACCURACY RULES:
@@ -931,12 +1048,16 @@ app.post('/api/siwes', async (req, res) => {
 
       // Wait 10 seconds before the next chapter to avoid rate limit
       if (p.chapterNum < 5) {
-        console.log(`[SIWES] Waiting 10s to avoid rate limit...`);
-        await new Promise(r => setTimeout(r, 10000));
+        console.log(`[SIWES] Next chapter...`);
+        await new Promise(r => setTimeout(r, 1500));
       }
         }
     console.log(`[SIWES] All chapters generated. Building DOCX...`);
 
+    for (const ch of chapters) ch.items = applyOfficialHeadings(ch.num, parseChapter(ch.text));
+    const layout = estimateLayout(chapters, images);
+    const tocEntries = buildTocEntries(layout, images, 1);
+    const tocMode = JSZipLib ? 'field' : 'static';
     const children = [];
 
     // ===== TITLE PAGE =====
@@ -1039,7 +1160,8 @@ app.post('/api/siwes', async (req, res) => {
     children.push(docxPara(""));
     // Real Word table of contents: it lists the real headings with real page numbers
     // (Word asks once to update fields when the file is opened).
-    children.push(new TableOfContents("Table of Contents", { hyperlink: true, headingStyleRange: "1-2" }));
+    if (tocMode === 'field') children.push(new TableOfContents("Table of Contents", { hyperlink: true, headingStyleRange: "1-2" }));
+    else staticTocParagraphs(tocEntries).forEach(p => children.push(p));
     children.push(docxPageBreak());
 
     // ===== LIST OF FIGURES =====
@@ -1121,10 +1243,11 @@ app.post('/api/siwes', async (req, res) => {
         }
       }
 
-      const parsed = parseChapter(ch.text);
-      for (const item of parsed) {
-        if (item.type === "subheading") {
+      for (const item of ch.items) {
+        if (item.type === "official") {
           children.push(docxSubheading(item.text));
+        } else if (item.type === "minor") {
+          children.push(docxPara(item.text, { bold: true, afterSpacing: 100 }));
         } else if (item.type === "bullet") {
           // 🚨 FIXED: Renders real Word bullet points
           children.push(new Paragraph({
@@ -1139,7 +1262,7 @@ app.post('/api/siwes', async (req, res) => {
       }
 
       if (ch.num === 5) {
-        children.push(docxSubheading("References"));
+        children.push(docxSubheading("d. References"));
         children.push(docxPara(""));
         const refs = getDepartmentReferences(formData.dept);
         refs.forEach(r => children.push(docxPara(r, { size: 22, afterSpacing: 160 })));
@@ -1163,7 +1286,7 @@ app.post('/api/siwes', async (req, res) => {
     const doc = new Document({
       creator: formData.fullName || "MudyHub Student",
       title: "SIWES Technical Report",
-      features: { updateFields: true },
+      ...(tocMode === 'field' && process.env.SIWES_TOC_UPDATE_PROMPT !== 'false' ? { features: { updateFields: true } } : {}),
       styles: {
         default: {
           heading1: { run: { font: "Times New Roman", size: 32, bold: true, color: "000000" }, paragraph: { alignment: AlignmentType.CENTER } },
@@ -1182,7 +1305,19 @@ app.post('/api/siwes', async (req, res) => {
       ]
     });
 
-    const buffer = await Packer.toBuffer(doc);
+    let buffer = await Packer.toBuffer(doc);
+    if (tocMode === 'field') {
+      try {
+        const zip = await JSZipLib.loadAsync(buffer);
+        let xml = await zip.file('word/document.xml').async('string');
+        const i = xml.indexOf('<w:sdt>'), j = xml.indexOf('</w:sdt>', i);
+        if (i >= 0 && j > i) {
+          xml = xml.slice(0, i) + tocSdtXml(tocEntries) + xml.slice(j + 8);
+          zip.file('word/document.xml', xml);
+          buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+        }
+      } catch (e) { console.warn('[SIWES] Could not pre-fill the contents page:', e.message); }
+    }
     await db.ref(`users/${uid}/transactions/siwes_${requestId}`).update({ status:'completed', completedAt:Date.now() });
     await db.ref(`walletLedger/${uid}/siwes_${requestId}`).update({ status:'completed', completedAt:Date.now() });
     await siwesUserRef.child(`siwesCharges/${requestId}`).update({ status:'completed', completedAt:Date.now() });
