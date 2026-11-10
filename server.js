@@ -381,6 +381,147 @@ CRITICAL WRITING RULES:
 8. You must write detailed paragraphs to ensure the final document is between 20 to 25 pages when printed. Do not write excessively long chapters; follow the word count instructions exactly.
 `;
 
+// -----------------------------------------------------
+// Report data clean-up and the "fact sheet" that keeps all five chapters consistent
+// -----------------------------------------------------
+const SMALL_WORDS = new Set(['of','and','the','in','for','at','on','to','a','an','&']);
+function titleCaseName(v) {
+  const t = String(v == null ? '' : v).trim();
+  if (!t) return t;
+  return t.split(/\s+/).map((w, i) => {
+    if (/^[A-Z0-9&.\-()]{2,}$/.test(w)) return w;             // keep acronyms: ND, SIWES, NBTE, CNC
+    if (i > 0 && SMALL_WORDS.has(w.toLowerCase())) return w.toLowerCase();
+    return w.charAt(0).toUpperCase() + w.slice(1);
+  }).join(' ');
+}
+const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+function parseISODate(v) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v || '').trim());
+  if (!m) return null;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+  return isNaN(d) ? null : d;
+}
+function formatLongDate(d) { return `${d.getUTCDate()} ${MONTH_NAMES[d.getUTCMonth()]} ${d.getUTCFullYear()}`; }
+function normalizeForm(raw) {
+  const f = { ...raw };
+  for (const k of ['orgName', 'institution', 'supervisorName', 'orgAddress', 'faculty', 'dept', 'orgUnit']) if (f[k]) f[k] = titleCaseName(f[k]);
+  if (f.level) {
+    const lv = String(f.level).trim();
+    const m = /^(ND|HND)\s*-?\s*([12])$/i.exec(lv);
+    f.level = m ? `${m[1].toUpperCase()} ${m[2] === '1' ? 'I' : 'II'}` : lv;
+  }
+  const sd = parseISODate(f.startDate), ed = parseISODate(f.endDate);
+  f._start = sd ? sd.toISOString().slice(0, 10) : null;
+  f._end = ed ? ed.toISOString().slice(0, 10) : null;
+  if (sd) f.startDate = formatLongDate(sd);
+  if (ed) f.endDate = formatLongDate(ed);
+  return f;
+}
+function trainingSpan(f) {
+  const sd = parseISODate(f._start), ed = parseISODate(f._end);
+  if (!sd || !ed || ed < sd) return null;
+  const days = Math.round((ed - sd) / 86400000) + 1;
+  const months = [];
+  const cur = new Date(Date.UTC(sd.getUTCFullYear(), sd.getUTCMonth(), 1));
+  while (cur <= ed && months.length < 14) { months.push(`${MONTH_NAMES[cur.getUTCMonth()]} ${cur.getUTCFullYear()}`); cur.setUTCMonth(cur.getUTCMonth() + 1); }
+  return { days, weeks: Math.max(1, Math.round(days / 7)), monthsApprox: Math.max(1, Math.round(days / 30.4)), monthList: months,
+           years: [...new Set([sd.getUTCFullYear(), ed.getUTCFullYear()])] };
+}
+
+async function buildFactSheet(f) {
+  const span = trainingSpan(f);
+  const lines = [
+    `Student: ${f.fullName}${f.matric ? ' (' + f.matric + ')' : ''}`,
+    `Host organisation (the ONLY organisation to name): ${f.orgName}${f.orgAddress ? ', ' + f.orgAddress : ''}`,
+    f.supervisorName ? `Industry supervisor: ${f.supervisorName}${f.supervisorPosition ? ' (' + f.supervisorPosition + ')' : ''} — use this exact name for the supervisor` : '',
+    `Institution (the ONLY school to name): ${f.institution}; Department: ${f.dept}${f.faculty ? '; Faculty: ' + f.faculty : ''}; Level: ${f.level || 'ND II'}`,
+    `Training period: ${f.startDate} to ${f.endDate}` + (span ? ` (${span.weeks} weeks, about ${span.monthsApprox} month${span.monthsApprox > 1 ? 's' : ''}). Months covered: ${span.monthList.join(', ')}.` : '.')
+  ].filter(Boolean);
+  const allowedYears = new Set(span ? span.years : []);
+  let foundedYear = null, bibleText = '';
+  try {
+    const bibleRaw = await callGroq({
+      systemPrompt: 'You create a short consistent background fact file for a Nigerian student industrial training report. Reply with JSON only.',
+      messages: [{ role: 'user', content: `Host organisation: ${f.orgName} (${f.orgSector || 'sector not stated'}), ${f.orgAddress || 'Nigeria'}. Student department: ${f.dept}. Student role: ${f.jobRole || 'student trainee'}. Industry supervisor: ${f.supervisorName || 'not given'}.
+Invent realistic supporting details that fit a small-to-medium Nigerian organisation of this kind. Return JSON with keys:
+"founded" (a year between 1985 and 2020),
+"services" (array of 3-4 short service names),
+"staff" (array of 5 objects {"name","role"} — Nigerian names; if a supervisor was given, include them with their real role),
+"equipment" (array of 6-8 equipment/tools that really exist in this kind of workplace),
+"monthlyFocus" (array with one short sentence per training month in this list: ${span ? span.monthList.join(' | ') : 'month 1 | month 2 | month 3 | month 4'}),
+"projectIdea" (one realistic, modest project a student could take part in).` }],
+      model: MODELS.default, jsonMode: true, maxTokens: 1500, temperature: 0.7
+    });
+    const bible = JSON.parse(String(bibleRaw).replace(/```json|```/g, '').trim());
+    if (Number.isInteger(bible.founded)) { foundedYear = bible.founded; allowedYears.add(foundedYear); }
+    const staff = Array.isArray(bible.staff) ? bible.staff.slice(0, 6).map(x => `${x.name} (${x.role})`).join('; ') : '';
+    bibleText = [
+      foundedYear ? `Organisation founded: ${foundedYear}` : '',
+      Array.isArray(bible.services) ? `Services: ${bible.services.slice(0, 5).join('; ')}` : '',
+      staff ? `Staff (use ONLY these names for colleagues): ${staff}` : '',
+      Array.isArray(bible.equipment) ? `Equipment/tools on site: ${bible.equipment.slice(0, 8).join('; ')}` : '',
+      Array.isArray(bible.monthlyFocus) ? `What the student did, month by month: ${bible.monthlyFocus.slice(0, 6).join(' | ')}` : '',
+      bible.projectIdea ? `Project (if the student gave none): ${bible.projectIdea}` : ''
+    ].filter(Boolean).join('\n');
+  } catch (e) { console.warn('[SIWES] Fact file step skipped:', e.message); }
+  const text = `
+FACT SHEET — every chapter must agree with this exactly. Student-supplied details always win; the invented background below is only for filling gaps.
+${lines.join('\n')}
+${bibleText}
+CONSISTENCY RULES:
+- Name only the host organisation and institution above. Never mention any other company, workshop, plant, polytechnic or training centre.
+- Every date you mention must fall inside the training period (${f.startDate} to ${f.endDate}). The only other year you may use is the founding year above. Never mention any other year except well-known historical dates (for example SIWES began in 1973).
+- The training lasted ${span ? span.weeks + ' weeks (about ' + span.monthsApprox + ' month' + (span.monthsApprox > 1 ? 's' : '') + ')' : 'the stated period'}. Do not state any other duration.
+- Keep supervisor, colleague names, equipment and the project the same in every chapter.`;
+  return { text, allowedYears, foundedYear, span };
+}
+
+// Catches the mistakes a model makes when chapters are written separately.
+function findProblems(text, chapterNum, f, fact) {
+  const problems = [];
+  const lower = text.toLowerCase();
+  const orgL = String(f.orgName || '').toLowerCase(), instL = String(f.institution || '').toLowerCase();
+  for (const m of text.matchAll(/\b(?:19|20)\d{2}\b/g)) {
+    const y = Number(m[0]);
+    if (fact.allowedYears.has(y)) continue;
+    if (chapterNum === 1 && y < 2000) continue;           // SIWES history (1973 etc.)
+    problems.push(`the year ${y} is not allowed`);
+  }
+  for (const name of foreignOrgs(text, f)) problems.push(`"${name}" is a different organisation — use "${f.orgName}"`);
+  if (fact.span) {
+    const okMonths = new Set([fact.span.monthsApprox - 1, fact.span.monthsApprox, fact.span.monthsApprox + 1].filter(n => n > 0));
+    const words = { one:1, two:2, three:3, four:4, five:5, six:6, seven:7, eight:8, nine:9, ten:10, eleven:11, twelve:12 };
+    for (const m of lower.matchAll(/\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)[\s‑-]+(week|month)s?\b/g)) {
+      const n = /^\d/.test(m[1]) ? Number(m[1]) : words[m[1]];
+      if (m[2] === 'month' && !okMonths.has(n)) problems.push(`"${m[0]}" does not match the real duration of ${fact.span.weeks} weeks`);
+      if (m[2] === 'week' && Math.abs(n - fact.span.weeks) > 1 && n > 4) problems.push(`"${m[0]}" does not match the real duration of ${fact.span.weeks} weeks`);
+    }
+  }
+  return [...new Set(problems)].slice(0, 8);
+}
+const ORG_PAT = /\b((?:[A-Z][A-Za-z&'-]+\s){1,5}(?:Ltd\.?|Limited|Works|Workshop|Plant|Enterprises|Industries|Foundry|Polytechnic))\b/g;
+const LEAD_WORDS = new Set(['The','Our','My','This','That','Each','Every','Your','His','Her','Their','A','An','In','At','For','Of','To','And','At','During','From','With','By','On']);
+function foreignOrgs(text, f) {
+  const orgL = String(f.orgName || '').toLowerCase(), instL = String(f.institution || '').toLowerCase();
+  const found = [];
+  for (const m of text.matchAll(ORG_PAT)) {
+    const words = m[1].split(/\s+/);
+    while (words.length > 1 && LEAD_WORDS.has(words[0])) words.shift();
+    if (words.length < 2) continue;                       // e.g. "The Polytechnic"
+    const name = words.join(' ');
+    const n = name.toLowerCase();
+    if (orgL.includes(n) || n.includes(orgL) || instL.includes(n) || n.includes(instL)) continue;
+    found.push(name);
+  }
+  return [...new Set(found)];
+}
+function fallbackFix(text, f) {
+  let out = text;
+  for (const name of foreignOrgs(text, f)) out = out.split(name).join(f.orgName);
+  out = out.split(f.orgName + '.,').join(f.orgName + ',').split(f.orgName + '..').join(f.orgName + '.');
+  return out;
+}
+
 function buildChapterPrompts(form) {
   const f = form;
   const dept = (f.dept || "General").toLowerCase();
@@ -566,7 +707,13 @@ UNIQUENESS ASSIGNMENT (report code ${v.seed}) — this report must read differen
 - Vocabulary: ${v.vocab}.
 - Emphasis: ${v.focus}.
 - Never reuse stock textbook sentences. Re-express every general fact (SIWES history, definitions, aims) in fresh wording and tie it to this student's course, organisation and own experience.
-- Include concrete, specific details from the student's answers (names, tools, dates, tasks) wherever possible.`;
+- Include concrete, specific details from the student's answers (names, tools, dates, tasks) wherever possible.
+${v.facts || ''}
+TECHNICAL ACCURACY RULES:
+- Everything technical must be correct and realistic for a Nigerian workplace of this size. If unsure of a number, use a conservative, typical value or leave it out.
+- A student trainee observes, assists and performs supervised tasks; do not claim the student designed, installed or commissioned major systems, or took decisions beyond a trainee's authority.
+- SIWES facts: it was started by the Industrial Training Fund (ITF) in 1973. The bodies involved are the ITF, the National Universities Commission (NUC), the National Board for Technical Education (NBTE) and the National Commission for Colleges of Education (NCCE). Use these exact names and describe their roles in general, accurate terms without inventing specific powers.
+- Write plain paragraphs. Do not write a chapter title or number (it is added automatically), and do not use horizontal lines or italics.`;
 }
 
 async function generateChapter(prompt, maxTokens = 4000, variation = null) {
@@ -582,11 +729,25 @@ async function generateChapter(prompt, maxTokens = 4000, variation = null) {
 function stripMarkdown(text) {
   if (!text) return "";
   let c = text;
-  // Remove hashtags and code blocks (we KEEP ** and - for the docx builder)
   c = c.replace(/^#{1,6}\s+/gm, "");
   c = c.replace(/```[\s\S]*?```/g, "");
   c = c.replace(/`([^`]+)`/g, "$1");
   c = c.replace(/^>\s+/gm, "");
+  c = c.replace(/^\s*([-_*]\s*){3,}\s*$/gm, "");                 // horizontal rules (---, ***)
+  c = c.replace(/^\*\s+/gm, "- ");                                  // "* item" bullets -> "- item"
+  c = c.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1$2");        // *italic* -> plain text
+  // The chapter title is added by the document builder: drop any title lines the AI wrote itself.
+  const lines = c.split(/\r?\n/);
+  let guard = 0;
+  while (lines.length && guard++ < 4) {
+    const t = lines[0].trim();
+    const letters = t.replace(/[^A-Za-z]/g, "");
+    const mostlyUpper = letters.length >= 6 && (letters.replace(/[^A-Z]/g, "").length / letters.length) > 0.8 && t.length < 160;
+    if (!t || /^\**\s*CHAPTER\s+(ONE|TWO|THREE|FOUR|FIVE|\d)/i.test(t) || mostlyUpper) lines.shift(); else break;
+  }
+  c = lines.join("\n");
+  // Remove unbalanced bold markers left on a line.
+  c = c.split("\n").map(l => ((l.match(/\*\*/g) || []).length % 2 === 1) ? l.replace(/\*\*/g, "") : l).join("\n");
   c = c.replace(/\n{3,}/g, "\n\n");
   return c.trim();
 }
@@ -703,7 +864,8 @@ app.post('/api/siwes', async (req, res) => {
   let uid;
   try { uid = await authenticatedUid(req); }
   catch (_) { return res.status(401).json({ error: 'Please sign in before generating a SIWES report.' }); }
-  const { uid: suppliedUid, formData, images } = req.body || {};
+  const { uid: suppliedUid, formData: rawFormData, images } = req.body || {};
+  const formData = (rawFormData && typeof rawFormData === 'object') ? normalizeForm(rawFormData) : rawFormData;
   if (suppliedUid && suppliedUid !== uid) return res.status(403).json({ error: 'The submitted account does not match your signed-in account.' });
   if (!formData || typeof formData !== 'object') return res.status(400).json({ error: 'Missing report form data.' });
 
@@ -745,6 +907,8 @@ app.post('/api/siwes', async (req, res) => {
 
     const prompts = buildChapterPrompts(formData);
     const reportVariation = buildVariation();
+    const fact = await buildFactSheet(formData);
+    reportVariation.facts = fact.text;
     const chapters = [];
 
     for (const p of prompts) {
@@ -754,7 +918,16 @@ app.post('/api/siwes', async (req, res) => {
       const maxTokensForChapter = p.chapterNum === 3 ? 3500 : 2000; 
       const raw = await generateChapter(p.prompt, maxTokensForChapter, reportVariation); 
       
-      chapters.push({ num: p.chapterNum, title: p.title, text: stripMarkdown(raw) });
+      let chapterText = stripMarkdown(raw);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const problems = findProblems(chapterText, p.chapterNum, formData, fact);
+        if (!problems.length) break;
+        console.log(`[SIWES] ${p.title}: fixing ${problems.length} consistency problem(s): ${problems.join(' | ')}`);
+        const retry = await generateChapter(p.prompt + `\n\nCORRECTION REQUIRED: your previous draft broke the fact sheet. Rewrite the whole chapter and fix these problems: ${problems.join('; ')}.`, maxTokensForChapter, reportVariation);
+        chapterText = stripMarkdown(retry);
+      }
+      chapterText = fallbackFix(chapterText, formData);
+      chapters.push({ num: p.chapterNum, title: p.title, text: chapterText });
 
       // Wait 10 seconds before the next chapter to avoid rate limit
       if (p.chapterNum < 5) {
@@ -872,14 +1045,17 @@ app.post('/api/siwes', async (req, res) => {
     // ===== LIST OF FIGURES =====
     children.push(docxHeading("LIST OF FIGURES", 1));
     children.push(docxPara(""));
+    const figOrg = formData.orgName || "the organisation";
+    const workCaps = [`Author on duty at ${figOrg}`, `Author with colleagues at ${figOrg}`, `Author operating equipment at ${figOrg}`];
+    const projName = formData.projectTitle || "the project";
+    const projCaps = [`Project work in progress: ${projName}`, `Completed project output: ${projName}`];
     const figures = [];
     if (images?.logo?.data) figures.push("Figure 2.1: Organisation Logo");
     if (images?.organogram?.data) figures.push("Figure 2.2: Organisational Chart");
-    if (images?.work1?.data) figures.push("Figure 3.1: Author on duty at the workshop");
-    if (images?.work2?.data) figures.push("Figure 3.2: Author with colleagues during a task");
-    if (images?.work3?.data) figures.push("Figure 3.3: Author operating equipment");
-    if (images?.project1?.data) figures.push("Figure 3.4: Project work in progress");
-    if (images?.project2?.data) figures.push("Figure 3.5: Completed project output");
+    let listN = 0;
+    for (const k of ["work1", "work2", "work3"]) if (images?.[k]?.data) { listN++; figures.push(`Figure 3.${listN}: ${workCaps[listN - 1]}`); }
+    let listP = 0;
+    for (const k of ["project1", "project2"]) if (images?.[k]?.data) { listN++; listP++; figures.push(`Figure 3.${listN}: ${projCaps[listP - 1]}`); }
     if (!figures.length) figures.push("No figures available for this report.");
     figures.forEach(f => children.push(docxPara(f, { size: 22, afterSpacing: 100 })));
     children.push(docxPageBreak());
@@ -894,7 +1070,7 @@ app.post('/api/siwes', async (req, res) => {
     children.push(docxHeading("ABSTRACT", 1, true));
     children.push(docxPara(""));
     children.push(docxPara(
-      `\nThis report presents a detailed account of the Student Industrial Work Experience Scheme (SIWES) attachment undertaken by ${formData.fullName || "the student"} at ${formData.orgName || "an organisation"} from ${formData.startDate || ""} to ${formData.endDate || ""}, as part of the ${formData.level || "ND II"} ${formData.dept || "programme"} at ${formData.institution || "Nuhu Bamalli Polytechnic, Zaria"}. During the attachment, the student worked in the ${formData.orgUnit || "relevant"} unit as a ${formData.jobRole || "student intern"}. The report covers the organisation's profile, the practical experience acquired, the projects handled, the technical and interpersonal challenges encountered, and the lessons learned. The SIWES programme provided invaluable practical exposure that complemented the theoretical knowledge gained in the classroom and significantly enhanced the student's technical and soft skills.`
+      `\nThis report presents a detailed account of the Student Industrial Work Experience Scheme (SIWES) attachment undertaken by ${formData.fullName || "the student"} at ${formData.orgName || "an organisation"} from ${formData.startDate || ""} to ${formData.endDate || ""}, as part of the ${formData.level || "ND II"} ${formData.dept || "programme"} at ${formData.institution || "Nuhu Bamalli Polytechnic, Zaria"}. During the attachment, the student ${formData.orgUnit ? "was placed in the " + formData.orgUnit + " unit and gained experience by " : "gained experience by "}${String(formData.jobRole || "observing and assisting with supervised work").replace(/^as an? /i, "").replace(/\.$/, "").toLowerCase()}. The report covers the organisation's profile, the practical experience acquired, the projects handled, the technical and interpersonal challenges encountered, and the lessons learned. The SIWES programme provided invaluable practical exposure that complemented the theoretical knowledge gained in the classroom and significantly enhanced the student's technical and soft skills.`
     ));
     children.push(docxPageBreak());
 
@@ -925,11 +1101,12 @@ app.post('/api/siwes', async (req, res) => {
                 alignment: AlignmentType.CENTER,
                 children: [new ImageRun({ data: dataUriToBuffer(img.data), transformation: { width: 450, height: 320 } })]
               }));
-              children.push(docxPara(`Figure 3.${figN}: Author on duty at ${formData.orgName || "the organisation"}`, { center: true, italic: true, size: 20 }));
+              children.push(docxPara(`Figure 3.${figN}: ${workCaps[figN - 1]}`, { center: true, italic: true, size: 20 }));
               figN++;
             } catch (e) { console.error("Work image error:", e); }
           }
           const projImgs = [images.project1, images.project2].filter(i => i?.data);
+          let projIdx = 0;
           for (const img of projImgs) {
             try {
               // 🚨 FIXED: Aspect ratio changed to 450x320
@@ -937,7 +1114,7 @@ app.post('/api/siwes', async (req, res) => {
                 alignment: AlignmentType.CENTER,
                 children: [new ImageRun({ data: dataUriToBuffer(img.data), transformation: { width: 450, height: 320 } })]
               }));
-              children.push(docxPara(`Figure 3.${figN}: ${formData.projectTitle || "Project work"}`, { center: true, italic: true, size: 20 }));
+              children.push(docxPara(`Figure 3.${figN}: ${projCaps[projIdx++]}`, { center: true, italic: true, size: 20 }));
               figN++;
             } catch (e) { console.error("Project image error:", e); }
           }
@@ -962,7 +1139,7 @@ app.post('/api/siwes', async (req, res) => {
       }
 
       if (ch.num === 5) {
-        children.push(docxSubheading("d. References"));
+        children.push(docxSubheading("References"));
         children.push(docxPara(""));
         const refs = getDepartmentReferences(formData.dept);
         refs.forEach(r => children.push(docxPara(r, { size: 22, afterSpacing: 160 })));
