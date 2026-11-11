@@ -885,10 +885,13 @@ function parseChapter(text) {
     }
 
     // 2. Detect Subheadings
-    const isSubheading =
+    // A short line wrapped in bold (**Heading**) is a heading, not a paragraph.
+    const boldWrapped = /^\*\*[^*]{3,95}\*\*:?$/.test(line) && !/[.!?]\*\*:?$/.test(line);
+    const monthHeading = /^(month|week)\s+\d+\b[^.]{0,110}$/i.test(line.replace(/\*\*/g, ""));
+    const isSubheading = boldWrapped || monthHeading ||
       /^[a-eA-E]\.\s+[A-Z]/.test(line) ||
       /^[a-eA-E]\)\s+/.test(line) ||
-      (line.length < 80 && /^(definition|brief history|importance|aim|bodies|mission|vision|organisational chart|experience|summary|problems|solutions|conclusion|recommendation|references)\b/i.test(line));
+      (line.length < 80 && !/[.!?]$/.test(line) && /^\**\s*(definition|brief history|importance|aim|bodies|mission|vision|organisational chart|experience|summary|problems|solutions|conclusion|recommendation|references)\b/i.test(line));
       
     if (isSubheading) {
       out.push({ type: "subheading", text: line.replace(/\*\*/g, "") }); // Strip bold from headings
@@ -1169,8 +1172,8 @@ app.post('/api/siwes', async (req, res) => {
     children.push(docxPara(""));
     const figOrg = formData.orgName || "the organisation";
     const workCaps = [`Author on duty at ${figOrg}`, `Author with colleagues at ${figOrg}`, `Author operating equipment at ${figOrg}`];
-    const projName = formData.projectTitle || "the project";
-    const projCaps = [`Project work in progress: ${projName}`, `Completed project output: ${projName}`];
+    const projSuffix = formData.projectTitle ? `: ${formData.projectTitle}` : "";
+    const projCaps = [`Project work in progress${projSuffix}`, `Completed project output${projSuffix}`];
     const figures = [];
     if (images?.logo?.data) figures.push("Figure 2.1: Organisation Logo");
     if (images?.organogram?.data) figures.push("Figure 2.2: Organisational Chart");
