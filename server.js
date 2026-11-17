@@ -573,8 +573,11 @@ Invent realistic supporting details that fit a small-to-medium Nigerian organisa
 "staff" (array of 5 objects {"name","role"} — Nigerian names; if a supervisor was given, include them with their real role),
 "equipment" (array of 6-8 equipment/tools that really exist in this kind of workplace),
 "monthlyFocus" (array with one short sentence per training month in this list: ${span ? span.monthList.join(' | ') : 'month 1 | month 2 | month 3 | month 4'}),
-"projectIdea" (one realistic, modest project a student could take part in).` }],
-      model: MODELS.default, jsonMode: true, maxTokens: 900, temperature: 0.7
+"projectIdea" (one realistic, modest project a student could take part in),
+"mission" (ONE professional sentence beginning "To provide ..." describing the workshop's services, materials, methods and safety attitude; if the student supplied a mission (${f.orgMission || 'none'}), use the student's wording instead),
+"vision" (ONE professional sentence beginning "To maintain ..." or "To become ..." about dependable services and developing practical skills; if the student supplied a vision (${f.orgVision || 'none'}), use the student's wording instead),
+"challenges" (array of exactly 4 objects {"title","problem","solution"}: each is a real technical challenge that a trainee meets in this kind of workshop, such as dimensional accuracy when turning, workpiece alignment and holding, thread-cutting accuracy, drilling and tapping accuracy, fabrication alignment, tool condition and surface finish, or safe handling of machines. "problem" is 2 sentences; "solution" is 2 sentences describing what the trainee did. Do not describe any accident or breakdown.)` }],
+      model: MODELS.default, jsonMode: true, maxTokens: 1600, temperature: 0.6
     });
     const bible = JSON.parse(String(bibleRaw).replace(/```json|```/g, '').trim());
     if (Number.isInteger(bible.founded)) { foundedYear = bible.founded; allowedYears.add(foundedYear); }
@@ -585,7 +588,11 @@ Invent realistic supporting details that fit a small-to-medium Nigerian organisa
       staff ? `Staff (use ONLY these names for colleagues): ${staff}` : '',
       Array.isArray(bible.equipment) ? `Equipment/tools on site: ${bible.equipment.slice(0, 8).join('; ')}` : '',
       Array.isArray(bible.monthlyFocus) ? `What the student did, month by month: ${bible.monthlyFocus.slice(0, 6).join(' | ')}` : '',
+      bible.mission ? `MISSION (use this exact wording in Chapter Two, section b): ${bible.mission}` : '',
+      bible.vision ? `VISION (use this exact wording in Chapter Two, section c): ${bible.vision}` : '',
+      Array.isArray(bible.challenges) && bible.challenges.length ? `TECHNICAL CHALLENGES AND SOLUTIONS (use these four in Chapter Four, in this order, and do not add others): ${bible.challenges.slice(0, 4).map((c, i) => `${i + 1}. ${c.title}: problem - ${c.problem} solution - ${c.solution}`).join(' | ')}` : '',
       bible.projectIdea ? `Project (if the student gave none): ${bible.projectIdea}` : ''
+
     ].filter(Boolean).join('\n');
   } catch (e) { console.warn('[SIWES] Fact file step skipped:', e.message); }
   const text = `
@@ -741,6 +748,7 @@ ${STUDENT_VOICE_RULE}
 STRUCTURE:
 a. Problems / Challenges Faced in the Organisation
 b. Solutions to the Problems / Challenges Faced
+Write each challenge as its own paragraph beginning with its title, then its problem, then its solution. Use the TECHNICAL CHALLENGES in the fact sheet exactly; do not replace them.
 
 Student context:
 - Technical challenge 1: ${b(f.challenge1, "INVENT a realistic technical challenge")}
@@ -751,7 +759,7 @@ Student context:
 - Infrastructure issues: ${b(f.challengeInfrastructure, "INVENT a Nigerian infrastructure issue")}
 - Lessons learned: ${b(f.challengeLessons, "Summarize key lessons")}
 
-Write exactly 900 words. Make the challenges sound real and technical.`
+Write exactly 900 words. Make the challenges sound real and technical, and keep them consistent with the fact sheet.`
     },
     {
       chapterNum: 5,
@@ -1644,7 +1652,6 @@ app.post('/api/admin/withdrawal/action', async (req, res) => {
     await writeAudit(actor, 'reject_withdrawal_refund', 'withdrawal', id, reason, {status:w.status}, {status:'rejected', refundedAmount:amount});
     return res.json({ok:true,status:'rejected',refundedAmount:amount});
   } catch (e) { return adminResponseError(res, e); }
-});
 app.post('/api/admin/campaign/review', async (req, res) => {
   try {
     const actor = await requireAdmin(req, 'campaigns');
@@ -1938,6 +1945,3 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Models:`, MODELS);
 });
-
-
-        
