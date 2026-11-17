@@ -992,7 +992,7 @@ app.post('/api/siwes', async (req, res) => {
   let uid;
   try { uid = await authenticatedUid(req); }
   catch (_) { return res.status(401).json({ error: 'Please sign in before generating a SIWES report.' }); }
-  const { uid: suppliedUid, formData: rawFormData, images } = req.body || {};
+  const { uid: suppliedUid, formData: rawFormData, images, photos: rawPhotos } = req.body || {};
   const formData = (rawFormData && typeof rawFormData === 'object') ? normalizeForm(rawFormData) : rawFormData;
   if (suppliedUid && suppliedUid !== uid) return res.status(403).json({ error: 'The submitted account does not match your signed-in account.' });
   if (!formData || typeof formData !== 'object') return res.status(400).json({ error: 'Missing report form data.' });
@@ -1119,19 +1119,25 @@ app.post('/api/siwes', async (req, res) => {
     // ===== CERTIFICATION =====
     children.push(docxHeading("CERTIFICATION", 1));
     children.push(docxPara(""));
-    children.push(docxPara(`This is to certify that this SIWES technical report was carried out by ${formData.fullName || "the student"} (${formData.matric || "Matric No."}) of the Department of ${formData.dept || ""}, ${formData.institution || "Nuhu Bamalli Polytechnic, Zaria"}, and is approved as meeting the requirements of the institution.`));
+    children.push(docxPara(`This is to certify that this SIWES technical report was carried out by ${formData.fullName || "the student"} (${formData.matric || "Matric No."}) of the Department of ${formData.dept || ""}, ${formData.faculty ? formData.faculty + ", " : ""}${formData.institution || "the institution"}, under the Student Industrial Work Experience Scheme (SIWES) at ${formData.orgName || "the host organisation"}, from ${formData.startDate || ""} to ${formData.endDate || ""}.`));
     children.push(docxPara(""));
-    children.push(docxPara(""));
-    children.push(docxPara("_________________________________"));
-    children.push(docxPara((formData.supervisorName || "").toUpperCase(), { bold: true }));
-    children.push(docxPara(`Industry Supervisor (${formData.supervisorPosition || ""})`));
-    children.push(docxPara("Date: ___________________________"));
-    children.push(docxPara(""));
-    children.push(docxPara(""));
-    children.push(docxPara("_________________________________"));
-    children.push(docxPara("Engr. Shehu Bello", { bold: true }));
-    children.push(docxPara("School Supervisor"));
-    children.push(docxPara("Date: ___________________________"));
+    // Each signatory: their signature image if uploaded, otherwise a blank line to sign. Names are only shown when entered.
+    const sigBlock = (sig, name, title) => {
+      if (sig && sig.data) {
+        children.push(new Paragraph({ spacing: { before: 120, after: 0 }, children: [new ImageRun({ data: dataUriToBuffer(sig.data), transformation: { width: 160, height: 60 } })] }));
+      } else {
+        children.push(docxPara(""));
+        children.push(docxPara("_________________________________"));
+      }
+      children.push(docxPara(name ? String(name).toUpperCase() : "_________________________________", { bold: !!name }));
+      children.push(docxPara(title));
+      children.push(docxPara("Date: ___________________________"));
+      children.push(docxPara(""));
+    };
+    sigBlock(images?.sigIndustry, formData.supervisorName, `Industry Supervisor${formData.supervisorPosition ? " (" + formData.supervisorPosition + ")" : ""}`);
+    sigBlock(images?.sigSchool, formData.schoolSupervisorName, "School Supervisor (SIWES)");
+    sigBlock(images?.sigCoord, formData.schoolCoordinatorName, "SIWES Coordinator");
+    sigBlock(images?.sigHod, formData.hodName, "Head of Department");
     children.push(docxPageBreak());
 
     // ===== DEDICATION =====
@@ -1175,20 +1181,44 @@ app.post('/api/siwes', async (req, res) => {
     else staticTocParagraphs(tocEntries).forEach(p => children.push(p));
     children.push(docxPageBreak());
 
+    // ----- Figure table: the student's chosen placements, used for the List of Figures and for placing photos -----
+    const monthLabels = trainingSpan(formData)?.monthList || [];
+    let photoIn = Array.isArray(rawPhotos)
+      ? rawPhotos.slice(0, 12).filter(p => p && typeof p.data === "string" && p.data.startsWith("data:image/"))
+      : null;
+    if (!photoIn) {  // older app version: fixed upload slots
+      photoIn = [];
+      if (images?.organogram?.data) photoIn.push({ data: images.organogram.data, caption: "", place: "organogram" });
+      for (const k of ["work1", "work2", "work3"]) if (images?.[k]?.data) photoIn.push({ data: images[k].data, caption: "", place: "other" });
+      for (const k of ["project1", "project2"]) if (images?.[k]?.data) photoIn.push({ data: images[k].data, caption: "", place: "project" });
+    }
+    const placeRank = place => {
+      if (place === "organogram") return [2, 1];
+      if (place.startsWith("m:")) { const i = monthLabels.indexOf(place.slice(2)); return [3, i < 0 ? 50 : i]; }
+      if (place === "safety") return [3, 80];
+      if (place === "other") return [3, 90];
+      if (place === "project") return [3, 95];
+      return [3, 99];
+    };
+    const figTable = photoIn.map(p => {
+      const place = String(p.place || "other").slice(0, 40);
+      return { data: p.data, place, caption: String(p.caption || "").replace(/[\u0000-\u001f]/g, " ").trim().slice(0, 150), rank: placeRank(place) };
+    });
+    figTable.sort((a, b) => (a.rank[0] - b.rank[0]) || (a.rank[1] - b.rank[1]));
+    const fallbackCap = { organogram: "Organisational Chart", safety: "Safety and tools", project: "Project work", other: "Work in the organisation" };
+    let n2 = images?.logo?.data ? 2 : 1, n3 = 1;
+    for (const f of figTable) {
+      const base = f.place.startsWith("m:") ? `Work during ${f.place.slice(2)}` : (fallbackCap[f.place] || "Work in the organisation");
+      f.cap = f.caption || base;
+      f.num = f.rank[0] === 2 ? `2.${n2++}` : `3.${n3++}`;
+    }
+
     // ===== LIST OF FIGURES =====
     children.push(docxHeading("LIST OF FIGURES", 1));
     children.push(docxPara(""));
-    const figOrg = formData.orgName || "the organisation";
-    const workCaps = [`Author on duty at ${figOrg}`, `Author with colleagues at ${figOrg}`, `Author operating equipment at ${figOrg}`];
-    const projSuffix = formData.projectTitle ? `: ${formData.projectTitle}` : "";
-    const projCaps = [`Project work in progress${projSuffix}`, `Completed project output${projSuffix}`];
     const figures = [];
     if (images?.logo?.data) figures.push("Figure 2.1: Organisation Logo");
-    if (images?.organogram?.data) figures.push("Figure 2.2: Organisational Chart");
-    let listN = 0;
-    for (const k of ["work1", "work2", "work3"]) if (images?.[k]?.data) { listN++; figures.push(`Figure 3.${listN}: ${workCaps[listN - 1]}`); }
-    let listP = 0;
-    for (const k of ["project1", "project2"]) if (images?.[k]?.data) { listN++; listP++; figures.push(`Figure 3.${listN}: ${projCaps[listP - 1]}`); }
+    figTable.forEach(f => figures.push(`Figure ${f.num}: ${f.cap}`));
     if (!figures.length) figures.push("No figures available for this report.");
     figures.forEach(f => children.push(docxPara(f, { size: 22, afterSpacing: 100 })));
     children.push(docxPageBreak());
@@ -1224,40 +1254,39 @@ app.post('/api/siwes', async (req, res) => {
           } catch (e) { console.error("Logo image error:", e); }
         }
 
-        if (ch.num === 3) {
-          const workImgs = [images.work1, images.work2, images.work3].filter(i => i?.data);
-          let figN = 1;
-          for (const img of workImgs) {
-            try {
-              // 🚨 FIXED: Aspect ratio changed to 450x320
-              children.push(new Paragraph({
-                alignment: AlignmentType.CENTER,
-                children: [new ImageRun({ data: dataUriToBuffer(img.data), transformation: { width: 450, height: 320 } })]
-              }));
-              children.push(docxPara(`Figure 3.${figN}: ${workCaps[figN - 1]}`, { center: true, italic: true, size: 20 }));
-              figN++;
-            } catch (e) { console.error("Work image error:", e); }
-          }
-          const projImgs = [images.project1, images.project2].filter(i => i?.data);
-          let projIdx = 0;
-          for (const img of projImgs) {
-            try {
-              // 🚨 FIXED: Aspect ratio changed to 450x320
-              children.push(new Paragraph({
-                alignment: AlignmentType.CENTER,
-                children: [new ImageRun({ data: dataUriToBuffer(img.data), transformation: { width: 450, height: 320 } })]
-              }));
-              children.push(docxPara(`Figure 3.${figN}: ${projCaps[projIdx++]}`, { center: true, italic: true, size: 20 }));
-              figN++;
-            } catch (e) { console.error("Project image error:", e); }
-          }
+        // Place each photo under the heading the student chose (Chapter 2 chart; Chapter 3 by month).
+        const figPhoto = f => {
+          const out = [];
+          try {
+            out.push(new Paragraph({ alignment: AlignmentType.CENTER, spacing: { before: 120, after: 60 },
+              children: [new ImageRun({ data: dataUriToBuffer(f.data), transformation: { width: 450, height: 320 } })] }));
+            out.push(docxPara(`Figure ${f.num}: ${f.cap}`, { center: true, italic: true, size: 20 }));
+          } catch (e) { console.error("Figure image error:", e.message); }
+          return out;
+        };
+        const placed = new Set();
+        const rules = ch.num === 2 ? [{ key: "organisational chart", places: ["organogram"] }]
+          : ch.num === 3 ? monthLabels.map(m => ({ key: m, places: ["m:" + m] })) : [];
+        const inserts = [];
+        for (const rule of rules) {
+          const hIdx = chHeads.findIndex(h => h.text.toLowerCase().includes(rule.key.toLowerCase()));
+          const group = figTable.filter(f => rule.places.includes(f.place) && f.rank[0] === ch.num && !placed.has(f));
+          if (hIdx < 0 || !group.length) continue;
+          group.forEach(f => placed.add(f));
+          const at = chHeads[hIdx + 1] ? chHeads[hIdx + 1].at : children.length;
+          inserts.push({ at, items: group.flatMap(figPhoto) });
         }
+        inserts.sort((x, y) => y.at - x.at).forEach(ins => children.splice(ins.at, 0, ...ins.items));
+        figTable.filter(f => f.rank[0] === ch.num && !placed.has(f)).forEach(f => figPhoto(f).forEach(el => children.push(el)));
       }
 
+      const chHeads = [];
       for (const item of ch.items) {
         if (item.type === "official") {
+          if (ch.num === 2 || ch.num === 3) chHeads.push({ at: children.length, text: item.text });
           children.push(docxSubheading(item.text));
         } else if (item.type === "minor") {
+          if (ch.num === 2 || ch.num === 3) chHeads.push({ at: children.length, text: item.text });
           children.push(docxPara(item.text, { bold: true, afterSpacing: 100 }));
         } else if (item.type === "bullet") {
           // 🚨 FIXED: Renders real Word bullet points
@@ -1333,8 +1362,33 @@ app.post('/api/siwes', async (req, res) => {
     await db.ref(`walletLedger/${uid}/siwes_${requestId}`).update({ status:'completed', completedAt:Date.now() });
     await siwesUserRef.child(`siwesCharges/${requestId}`).update({ status:'completed', completedAt:Date.now() });
 
+    // Keep a private copy so the user can download it later from "My Reports".
+    const storagePath = `siwesReports/${uid}/${requestId}.docx`;
+    let stored = false;
+    try {
+      const bucketName = process.env.FIREBASE_STORAGE_BUCKET;
+      if (!bucketName) throw new Error("FIREBASE_STORAGE_BUCKET is not set");
+      await admin.storage().bucket(bucketName).file(storagePath).save(buffer, {
+        resumable: false,
+        contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        metadata: { metadata: { uid } }
+      });
+      stored = true;
+    } catch (e) { console.warn("[SIWES] Report copy not saved:", e.message); }
+    await db.ref(`users/${uid}/siwesReports/${requestId}`).set({
+      id: requestId,
+      title: `SIWES Report - ${String(formData.fullName || "Student").slice(0, 80)}`,
+      matric: String(formData.matric || "").slice(0, 40),
+      org: String(formData.orgName || "").slice(0, 120),
+      createdAt: Date.now(),
+      size: buffer.length,
+      stored,
+      storagePath: stored ? storagePath : null
+    });
+
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
     res.setHeader("Content-Disposition", `attachment; filename="SIWES_Report_${formData.matric || uid}.docx"`);
+    res.setHeader("X-Report-Id", requestId);
     res.send(buffer);
 
     console.log(`[SIWES] ✅ Report sent for uid=${uid}, size=${buffer.length} bytes`);
@@ -1935,6 +1989,47 @@ app.get('/health', (req, res) => {
     modes: Object.keys(SYSTEM_PROMPTS),
     features: { think: true, vision: true, search: true, siwes: true, miniBank: true }
   });
+});
+
+// ---------- My Reports: list and re-download generated SIWES reports ----------
+app.get('/api/siwes/reports', async (req, res) => {
+  let uid;
+  try { uid = await authenticatedUid(req); }
+  catch (_) { return res.status(401).json({ error: 'Please sign in to see your reports.' }); }
+  try {
+    const snap = await db.ref(`users/${uid}/siwesReports`).limitToLast(100).once('value');
+    const reports = [];
+    snap.forEach(c => {
+      const r = c.val() || {};
+      reports.push({ id: r.id || c.key, title: r.title || 'SIWES Report', matric: r.matric || '', org: r.org || '', createdAt: r.createdAt || 0, stored: r.stored === true });
+    });
+    reports.sort((a, b) => b.createdAt - a.createdAt);
+    res.json({ reports });
+  } catch (e) {
+    console.error('[SIWES] list error:', e);
+    res.status(500).json({ error: 'Could not load your reports. Please try again.' });
+  }
+});
+
+app.get('/api/siwes/reports/:id/download', async (req, res) => {
+  let uid;
+  try { uid = await authenticatedUid(req); }
+  catch (_) { return res.status(401).json({ error: 'Please sign in to download this report.' }); }
+  try {
+    const id = String(req.params.id || '');
+    if (!/^[A-Za-z0-9_-]{1,100}$/.test(id)) return res.status(400).json({ error: 'Invalid report.' });
+    const r = (await db.ref(`users/${uid}/siwesReports/${id}`).once('value')).val();
+    if (!r) return res.status(404).json({ error: 'Report not found.' });
+    if (!r.stored || !r.storagePath) return res.status(410).json({ error: 'This report file was not saved. Please contact support with the date you generated it.' });
+    const bucket = admin.storage().bucket(process.env.FIREBASE_STORAGE_BUCKET);
+    const [data] = await bucket.file(r.storagePath).download();
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    res.setHeader("Content-Disposition", `attachment; filename="SIWES_Report_${r.matric || id}.docx"`);
+    res.send(data);
+  } catch (e) {
+    console.error('[SIWES] download error:', e);
+    res.status(500).json({ error: 'Could not download the report. Please try again.' });
+  }
 });
 
 app.get('/', (req, res) => {
