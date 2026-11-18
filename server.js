@@ -7,6 +7,9 @@ import registerTrueConnection from './true-connection-routes.js';
 import registerAdminV1 from './admin-v1-routes.js';
 import registerPromote from './promote-routes.js';
 import registerTasks from './tasks-routes.js';
+import registerRewards from './rewards-routes.js';
+import registerBusiness from './business-routes.js';
+import registerJobs from './jobs-routes.js';
 import {
   Document, Packer, Paragraph, TextRun, AlignmentType, ImageRun,
   PageBreak, Footer, PageNumber, HeadingLevel, NumberFormat, TableOfContents, TabStopType, LeaderType
@@ -1834,6 +1837,9 @@ registerTrueConnection({ app, admin, db, authenticatedUid, requireAdmin, writeAu
 registerAdminV1({ app, admin, db, requireAdmin, writeAudit, adminResponseError });
 registerPromote({ app, admin, db, authenticatedUid });
 registerTasks({ app, admin, db, authenticatedUid });
+registerRewards({ app, admin, db, authenticatedUid });
+registerBusiness({ app, admin, db, authenticatedUid, requireAdmin, writeAudit });
+registerJobs({ app, admin, db, authenticatedUid });
 app.get("/api/payment-config", async (req, res) => {
   const keys = paystackKeys();
   if (!keys.publicKey) return res.status(503).json({ error: `Paystack ${keys.mode} public key is not configured (it must start with pk_${keys.mode}_).` });
