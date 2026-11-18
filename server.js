@@ -21,7 +21,7 @@ const app = express();
 // MIDDLEWARE
 // -----------------------------------------------------
 const allowedOrigins = new Set(
-  String(process.env.FRONTEND_ORIGINS || 'https://mudihub.netlify.app')
+  String(process.env.FRONTEND_ORIGINS || 'https://mudyhub.pages.dev')
     .split(',').map(v => v.trim()).filter(Boolean)
 );
 app.use(cors({
@@ -93,6 +93,8 @@ const SYSTEM_PROMPTS = {
   campus: `You are MudyCampus AI, a dedicated academic and educational assistant built specifically for tertiary students (Universities, Polytechnics, and Colleges).
 
 STRICT RULE: You are ONLY allowed to answer educational, academic, career, and school-related questions (e.g., SIWES/IT reports, assignment questions, course explanations, project topics, study plans, CV writing, and exam prep).
+
+GREETINGS: If the user only greets you or makes small talk (for example "hello", "hi", "good morning", "how are you", "thanks"), reply warmly in one or two sentences, introduce yourself as MudyCampus AI, and invite a school question. Never refuse a greeting.
 
 IF the user asks a non-educational or off-topic question, respond with:
 "I am MudyCampus AI, your academic assistant. I can only help you with educational questions, assignments, SIWES reports, project topics, and study guides! Please ask a school-related question."
