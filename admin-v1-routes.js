@@ -44,6 +44,136 @@ export default function registerAdminV1({ app, admin, db, requireAdmin, writeAud
     });
     if (!r.committed || !r.snapshot.exists()) throw new Error('Refund could not be completed. Check the account and try again.');
     return { already };
+    
+  // ------------------------------------------------------------------
+  // USER STATISTICS — Super Admin only
+  route('/api/admin/users/stats', async (req) => {
+    await requireAdmin(req, 'super');
+
+    const users = (await val('users')) || {};
+    const records = Object.values(users).filter(
+      u => u && typeof u === 'object'
+    );
+
+    let active = 0;
+    let restricted = 0;
+    let verified = 0;
+
+    for (const u of records) {
+      if (
+        u.banned === true ||
+        u.status === 'banned' ||
+        u.status === 'restricted'
+      ) {
+        restricted++;
+      } else {
+        active++;
+      }
+
+      if (
+        u.verified === true ||
+        u.kycStatus === 'approved'
+      ) {
+        verified++;
+      }
+    }
+
+    return {
+      totalUsers: records.length,
+      activeUsers: active,
+      restrictedUsers: restricted,
+      verifiedUsers: verified
+    };
+  });
+
+  // ------------------------------------------------------------------
+  // ADMIN NOTIFICATION — Support or Super Admin
+  route('/api/admin/user/notify', async (req, b) => {
+    const actor = await anyOf(req, ['support', 'super']);
+
+    const uid = safeId(b.uid, 'User ID');
+    const message = clean(b.message, 500);
+
+    if (message.length < 5) {
+      throw new Error('Write a notification of at least 5 characters.');
+    }
+
+    const user = await val(`users/${uid}`);
+    if (!user) throw new Error('User not found.');
+
+    const now = Date.now();
+
+    const notification = {
+      type: 'admin_notice',
+      title: clean(b.title || 'MudyHub Notice', 80),
+      message,
+      createdAt: now,
+      read: false,
+      sentBy: actor.uid
+    };
+
+    const pushed = await db.ref(`notifications/${uid}`).push(notification);
+
+    await writeAudit(
+      actor,
+      'notify_user',
+      'user',
+      uid,
+      message,
+      null,
+      { notificationId: pushed.key }
+    );
+
+    return { notificationId: pushed.key };
+  });
+
+  // ------------------------------------------------------------------
+  // OFFICIAL USER WARNING — Support or Super Admin
+  route('/api/admin/user/warn', async (req, b) => {
+    const actor = await anyOf(req, ['support', 'super']);
+
+    const uid = safeId(b.uid, 'User ID');
+    const reason = requireReason(b.reason, 8);
+
+    const user = await val(`users/${uid}`);
+    if (!user) throw new Error('User not found.');
+
+    const now = Date.now();
+
+    const warningRef = db.ref(`userWarnings/${uid}`).push();
+
+    const warning = {
+      uid,
+      reason,
+      status: 'active',
+      issuedAt: now,
+      issuedBy: actor.uid,
+      adminName: clean(actor.name || 'MudyHub Admin', 80)
+    };
+
+    await warningRef.set(warning);
+
+    await db.ref(`notifications/${uid}`).push({
+      type: 'admin_warning',
+      title: 'Official MudyHub Warning',
+      message: `MudyHub has issued an official warning to your account. Reason: ${reason}`,
+      createdAt: now,
+      read: false
+    });
+
+    await writeAudit(
+      actor,
+      'warn_user',
+      'user',
+      uid,
+      reason,
+      null,
+      { warningId: warningRef.key }
+    );
+
+    return { warningId: warningRef.key };
+  });
+
   }
 
   // ------------------------------------------------------------------ users
