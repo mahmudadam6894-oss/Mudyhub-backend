@@ -180,23 +180,149 @@ export default function registerAdminV1({ app, admin, db, requireAdmin, writeAud
     return {};
   });
 
-  // ------------------------------------------------------------------ finance: confirm manual payout
+  
+  
+  // ------------------------------------------------------------------
+  // FINANCE: CONFIRM MANUAL BANK PAYOUT
+  // Safe retries, duplicate protection and audit logging.
+  // Only call after the actual bank transfer has been completed.
+  // ------------------------------------------------------------------
   route('/api/admin/withdrawal/mark-paid', async (req, b) => {
     const actor = await requireAdmin(req, 'withdrawals');
-    const id = safeId(b.id, 'withdrawal ID'); const reference = clean(b.reference, 80);
-    const wRef = db.ref(`withdrawalRequests/${id}`); const w = await val(`withdrawalRequests/${id}`);
-    if (!w) throw new Error('Withdrawal not found.');
-    const uid = String(w.uid || w.userId || ''); const amount = Number(w.amount || 0);
-    if (!uid || !(amount > 0)) throw new Error('Withdrawal record is incomplete.');
-    const claim = await wRef.child('status').transaction(cur => (cur === 'approved' ? 'paying' : undefined));
-    if (!claim.committed) throw new Error('Only approved withdrawals can be marked as paid (or it was already marked).');
+
+    const id = safeId(b.id, 'withdrawal ID');
+    const reference = clean(b.reference, 80);
+
+    if (reference.length < 3) {
+      throw new Error('Enter the actual bank transfer reference before confirming payment.');
+    }
+
+    const wRef = db.ref(`withdrawalRequests/${id}`);
+    const initial = await val(`withdrawalRequests/${id}`);
+
+    if (!initial) throw new Error('Withdrawal not found.');
+
+    const uid = String(initial.uid || initial.userId || '');
+    const amount = Number(initial.amount || 0);
+
+    if (!uid || !Number.isSafeInteger(amount) || amount <= 0) {
+      throw new Error('Withdrawal record is incomplete.');
+    }
+
+    // Already completed: never process it a second time.
+    if (initial.status === 'paid') {
+      if (initial.payoutReference !== reference) {
+        throw new Error('This withdrawal has already been paid with a different reference.');
+      }
+
+      return { status: 'paid', alreadyPaid: true };
+    }
+
+    // Claim the withdrawal or safely resume the same confirmation.
+    const claim = await wRef.transaction(current => {
+      if (!current) return;
+
+      if (current.status === 'approved') {
+        return {
+          ...current,
+          status: 'paying',
+          payoutStatus: 'confirming',
+          payoutReference: reference,
+          payingAt: Date.now(),
+          payingBy: actor.uid
+        };
+      }
+
+      // Resume a previous incomplete confirmation.
+      // A different admin can only take over if they are Super Admin.
+      if (
+        current.status === 'paying' &&
+        current.payoutReference === reference &&
+        (
+          current.payingBy === actor.uid ||
+          actor.role === 'super_admin'
+        )
+      ) {
+        return {
+          ...current,
+          payingBy: actor.uid,
+          lastPaymentRetryAt: Date.now()
+        };
+      }
+
+      return;
+    });
+
+    if (!claim.committed) {
+      throw new Error(
+        'This withdrawal cannot be processed. Check its current status and payment reference.'
+      );
+    }
+
+    const w = claim.snapshot.val();
     const now = Date.now();
-    await wRef.update({ status: 'paid', payoutStatus: 'paid', paidAt: now, paidBy: actor.uid, payoutReference: reference, payoutNotice: 'Bank payout completed.' });
-    if (w.ledgerId) await db.ref(`walletLedger/${uid}/${w.ledgerId}`).update({ status: 'paid', paidAt: now }).catch(() => {});
-    await db.ref(`notifications/${uid}/withdrawal_paid_${id}`).set({ type: 'withdrawal_paid', amount, message: `Your withdrawal of ₦${amount.toLocaleString()} has been paid to your bank account.`, createdAt: now, read: false });
-    await writeAudit(actor, 'mark_withdrawal_paid', 'withdrawal', id, reference ? `Ref ${reference}` : '', { status: 'approved' }, { status: 'paid' });
-    return { status: 'paid' };
+
+    // Update the existing reserved withdrawal ledger entry.
+    // Do not create another wallet debit.
+    if (w.ledgerId) {
+      await db.ref(`walletLedger/${uid}/${w.ledgerId}`).update({
+        status: 'paid',
+        paidAt: now,
+        payoutReference: reference
+      });
+    }
+
+    // Idempotent payout record for reconciliation.
+    await db.ref(`withdrawalPayouts/${id}`).set({
+      withdrawalId: id,
+      uid,
+      amount,
+      status: 'paid',
+      bankReference: reference,
+      confirmedBy: actor.uid,
+      confirmedAt: now,
+      ledgerId: w.ledgerId || null
+    });
+
+    // Fixed notification key prevents duplicate notifications on retries.
+    await db.ref(`notifications/${uid}/withdrawal_paid_${id}`).set({
+      type: 'withdrawal_paid',
+      amount,
+      message: `Your withdrawal of ₦${amount.toLocaleString()} has been paid to your bank account.`,
+      reference,
+      createdAt: now,
+      read: false
+    });
+
+    // Record the administrative action.
+    await writeAudit(
+      actor,
+      'mark_withdrawal_paid',
+      'withdrawal',
+      id,
+      `Manual bank payout confirmed. Reference: ${reference}`,
+      { status: 'approved' },
+      { status: 'paid', payoutReference: reference, amount }
+    );
+
+    // Final status is written only after the preceding operations succeed.
+    await wRef.update({
+      status: 'paid',
+      payoutStatus: 'paid',
+      paidAt: now,
+      paidBy: actor.uid,
+      payoutReference: reference,
+      payoutNotice: 'Manual bank payout completed and confirmed.'
+    });
+
+    return {
+      status: 'paid',
+      amount,
+      reference,
+      message: 'Withdrawal payment confirmed successfully.'
+    };
   });
+      
 
   // ------------------------------------------------------------------ True Connection: suspended members (reports are in true-connection-routes.js)
   route('/api/admin/tc/suspended', async (req) => {
