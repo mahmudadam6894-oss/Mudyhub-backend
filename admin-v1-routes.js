@@ -90,7 +90,11 @@ export default function registerAdminV1({ app, admin, db, requireAdmin, writeAud
   // ADMIN NOTIFICATION — Support or Super Admin
   route('/api/admin/user/notify', async (req, b) => {
     const actor = await anyOf(req, ['support', 'super']);
+    const actor = await anyOf(req, ["support"]);
 
+if (actor.role !== "super_admin") {
+  throw new Error("Forbidden: Super Admin only.");
+      }
     const uid = safeId(b.uid, 'User ID');
     const message = clean(b.message, 500);
 
