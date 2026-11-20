@@ -44,6 +44,7 @@ export default function registerAdminV1({ app, admin, db, requireAdmin, writeAud
     });
     if (!r.committed || !r.snapshot.exists()) throw new Error('Refund could not be completed. Check the account and try again.');
     return { already };
+    }
     
   // ------------------------------------------------------------------
   // USER STATISTICS — Super Admin only
@@ -86,15 +87,12 @@ export default function registerAdminV1({ app, admin, db, requireAdmin, writeAud
     };
   });
 
+  
   // ------------------------------------------------------------------
-  // ADMIN NOTIFICATION — Support or Super Admin
+  // ADMIN NOTIFICATION — Super Admin only
   route('/api/admin/user/notify', async (req, b) => {
-    const actor = await anyOf(req, ['support', 'super']);
-    const actor = await anyOf(req, ["support"]);
+    const actor = await requireAdmin(req, 'super');
 
-if (actor.role !== "super_admin") {
-  throw new Error("Forbidden: Super Admin only.");
-      }
     const uid = safeId(b.uid, 'User ID');
     const message = clean(b.message, 500);
 
@@ -130,11 +128,13 @@ if (actor.role !== "super_admin") {
 
     return { notificationId: pushed.key };
   });
+    
 
+  
   // ------------------------------------------------------------------
-  // OFFICIAL USER WARNING — Support or Super Admin
+  // OFFICIAL USER WARNING — Super Admin only
   route('/api/admin/user/warn', async (req, b) => {
-    const actor = await anyOf(req, ['support', 'super']);
+    const actor = await requireAdmin(req, 'super');
 
     const uid = safeId(b.uid, 'User ID');
     const reason = requireReason(b.reason, 8);
@@ -177,9 +177,7 @@ if (actor.role !== "super_admin") {
 
     return { warningId: warningRef.key };
   });
-
-  }
-
+  
   // ------------------------------------------------------------------ users
   route('/api/admin/user/lookup', async (req, b) => {
     const actor = await anyOf(req, ['support', 'verification', 'withdrawals', 'trueConnection']);
