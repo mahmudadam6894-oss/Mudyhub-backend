@@ -248,6 +248,192 @@ export default function registerAdminV1({
     return { items };
   });
 
+  // ------------------------------------------------------------
+  // ADMIN WALLET ADJUSTMENT — SUPER ADMIN ONLY
+  // Positive amount credits; negative amount debits.
+  // The user balance is changed transactionally and every change is logged.
+  // ------------------------------------------------------------
+
+  route('/api/admin/wallet/adjust', async (req, b) => {
+    const actor = await requireAdmin(req, 'super');
+    const uid = safeId(b.uid, 'user ID');
+    const rawAmount = Number(b.amount);
+    const reason = requireReason(b.reason, 10);
+
+    if (uid === actor.uid) {
+      throw new Error('You cannot adjust your own wallet.');
+    }
+
+    if (
+      !Number.isFinite(rawAmount) ||
+      rawAmount === 0 ||
+      Math.abs(rawAmount) > 1000000
+    ) {
+      throw new Error(
+        'Enter a valid non-zero amount. Maximum adjustment is ₦1,000,000.'
+      );
+    }
+
+    const amount = Math.round(rawAmount * 100) / 100;
+
+    if (Math.abs(amount - rawAmount) > 0.000001) {
+      throw new Error(
+        'Wallet adjustments can have no more than 2 decimal places.'
+      );
+    }
+
+    const userRef = db.ref(`users/${uid}`);
+    const beforeSnap = await userRef.once('value');
+
+    if (!beforeSnap.exists()) {
+      throw new Error('User not found.');
+    }
+
+    const beforeBalance = Number(
+      beforeSnap.val()?.walletBalance || 0
+    );
+
+    if (
+      !Number.isFinite(beforeBalance) ||
+      beforeBalance < 0
+    ) {
+      throw new Error(
+        'The user wallet balance is invalid. Review the account before adjusting it.'
+      );
+    }
+
+    const adjustmentId = db.ref(`walletLedger/${uid}`).push().key;
+
+    if (!adjustmentId) {
+      throw new Error(
+        'Could not create a wallet adjustment reference.'
+      );
+    }
+
+    const now = Date.now();
+
+    const ledgerRef = db.ref(
+      `walletLedger/${uid}/${adjustmentId}`
+    );
+
+    // Create a processing ledger record first.
+    await ledgerRef.set({
+      type: 'admin_adjustment',
+      direction: amount > 0 ? 'credit' : 'debit',
+      amount: Math.abs(amount),
+      signedAmount: amount,
+      reference: adjustmentId,
+      description: reason,
+      status: 'processing',
+      createdAt: now,
+      adminUid: actor.uid,
+      adminName: clean(actor.name || 'Admin', 100)
+    });
+
+    let insufficientBalance = false;
+
+    // Update the user's wallet transactionally.
+    const result = await userRef.transaction(user => {
+      if (user === null) return user;
+
+      const claims = user.adminWalletAdjustments || {};
+
+      // Prevent the same adjustment reference being applied twice.
+      if (claims[adjustmentId]) return user;
+
+      const current = Number(user.walletBalance || 0);
+
+      if (!Number.isFinite(current) || current < 0) {
+        return;
+      }
+
+      const next = Math.round(
+        (current + amount) * 100
+      ) / 100;
+
+      if (!Number.isFinite(next) || next < 0) {
+        insufficientBalance = true;
+        return;
+      }
+
+      user.walletBalance = next;
+
+      claims[adjustmentId] = {
+        amount,
+        reason,
+        by: actor.uid,
+        at: now
+      };
+
+      user.adminWalletAdjustments = claims;
+
+      return user;
+    });
+
+    if (!result.committed || !result.snapshot.exists()) {
+      await ledgerRef.update({
+        status: 'failed',
+        failedAt: Date.now(),
+        failureReason: insufficientBalance
+          ? 'Insufficient wallet balance.'
+          : 'Wallet transaction was not committed.'
+      });
+
+      throw new Error(
+        insufficientBalance
+          ? 'Insufficient wallet balance. The debit was not applied.'
+          : 'Wallet adjustment was not committed. No balance change was confirmed.'
+      );
+    }
+
+    const balanceAfter = Number(
+      result.snapshot.val()?.walletBalance || 0
+    );
+
+    // Mark the ledger record completed.
+    await ledgerRef.update({
+      status: 'completed',
+      completedAt: Date.now(),
+      balanceBefore: beforeBalance,
+      balanceAfter
+    });
+
+    // Record the action in the admin audit log.
+    await writeAudit(
+      actor,
+      'admin_wallet_adjustment',
+      'userWallet',
+      uid,
+      reason,
+      {
+        balanceBefore: beforeBalance
+      },
+      {
+        amount,
+        adjustmentId,
+        balanceAfter
+      }
+    );
+
+    // Notify the affected user.
+    await db.ref(
+      `notifications/${uid}/wallet_adjust_${adjustmentId}`
+    ).set({
+      type: 'wallet_adjustment',
+      amount,
+      message: amount > 0
+        ? `An admin adjustment of ₦${amount.toLocaleString()} was credited to your wallet.`
+        : `An admin adjustment of ₦${Math.abs(amount).toLocaleString()} was debited from your wallet.`,
+      createdAt: Date.now(),
+      read: false
+    });
+
+    return {
+      adjustmentId,
+      balance: balanceAfter
+    };
+  });
+        
 
   // ------------------------------------------------------------
   // ADMIN NOTIFICATION — SUPER ADMIN ONLY
