@@ -1465,7 +1465,11 @@ async function requireAdmin(req, permission = null) {
   const raw = snap.val();
   if (!raw) throw new Error('Forbidden');
   const record = raw === true ? { role: 'super_admin', status: 'active', name: 'Super Admin' } : raw;
-  if (record.status === 'banned' || record.status === 'disabled') throw new Error('Forbidden');
+  const adminStatus = record.status || 'active';
+
+  if (adminStatus !== 'active') {
+  throw new Error('Forbidden');
+   }
   if (!['super_admin', 'normal_admin'].includes(record.role)) throw new Error('Forbidden');
   if (permission && record.role !== 'super_admin') {
     const allowed = permission === 'tc:moderate'
