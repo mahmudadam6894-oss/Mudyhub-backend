@@ -210,7 +210,7 @@ export default function registerAdminV1({ app, admin, db, requireAdmin, writeAud
   });
 
   route('/api/admin/user/verify', async (req, b) => {
-    const actor = await anyOf(req, ['verification', 'trueConnection']);
+    const actor = await requireAdmin(req, 'verification');
     const uid = safeId(b.uid, 'user ID'); const verified = b.verified === true; const reason = requireReason(b.reason);
     const u = await val(`users/${uid}`); if (!u) throw new Error('User not found.');
     const before = { verified: u.verified === true, kycStatus: u.kycStatus || '' };
