@@ -165,6 +165,89 @@ export default function registerAdminV1({
       verifiedUsers: verified
     };
   });
+  
+  // ------------------------------------------------------------
+  // REGISTERED USER DIRECTORY — SUPER ADMIN ONLY
+  // Paginated, safe user information only.
+  // ------------------------------------------------------------
+
+  route('/api/admin/users/list', async (req, b) => {
+    await requireAdmin(req, 'super');
+
+    const limit = Math.min(
+      100,
+      Math.max(1, Math.floor(Number(b.limit) || 50))
+    );
+
+    const cursor = b.cursor
+      ? safeId(b.cursor, 'pagination cursor')
+      : null;
+
+    let q = db.ref('users').orderByKey();
+
+    if (cursor) {
+      q = q.startAfter(cursor);
+    }
+
+    const snap = await q
+      .limitToFirst(limit + 1)
+      .once('value');
+
+    const entries = Object.entries(snap.val() || {});
+    const hasMore = entries.length > limit;
+    const page = entries.slice(0, limit);
+
+    const users = page.map(([uid, u]) => ({
+      uid,
+      fullName: clean(u.fullName || u.fullname || u.name, 100),
+      username: clean(u.username, 40),
+      email: clean(u.email, 120),
+      createdAt: Number(u.createdAt || u.created_at || 0),
+      verified:
+        u.verified === true ||
+        u.kycStatus === 'approved',
+      banned:
+        u.banned === true ||
+        u.status === 'banned',
+      walletFrozen: u.walletFrozen === true
+    }));
+
+    return {
+      users,
+      nextCursor: hasMore ? page[page.length - 1][0] : null
+    };
+  });
+
+  // ------------------------------------------------------------
+  // USER WALLET HISTORY — SUPER ADMIN ONLY
+  // ------------------------------------------------------------
+
+  route('/api/admin/user/wallet-history', async (req, b) => {
+    await requireAdmin(req, 'super');
+
+    const uid = safeId(b.uid, 'user ID');
+
+    const snap = await db
+      .ref(`walletLedger/${uid}`)
+      .orderByChild('createdAt')
+      .limitToLast(50)
+      .once('value');
+
+    const items = Object.entries(snap.val() || {})
+      .map(([id, x]) => ({
+        id,
+        type: clean(x.type, 60),
+        direction: clean(x.direction, 20),
+        amount: Number(x.amount || 0),
+        description: clean(x.description, 200),
+        status: clean(x.status, 40),
+        createdAt: Number(x.createdAt || 0)
+      }))
+      .sort((a, b) => b.createdAt - a.createdAt);
+
+    return { items };
+  });
+
 
   // ------------------------------------------------------------
   // ADMIN NOTIFICATION — SUPER ADMIN ONLY
