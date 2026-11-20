@@ -1676,7 +1676,13 @@ app.post('/api/admin/withdrawal/action', async (req, res) => {
     if (!snap.exists()) throw new Error('Withdrawal request not found.');
     const w = snap.val(); const uid = String(w.uid || w.userId || ''); const amount = Number(w.amount || 0);
     if (!uid || !Number.isFinite(amount) || amount <= 0) throw new Error('Withdrawal record is incomplete.');
-    if (!['pending','processing'].includes(w.status)) throw new Error('This withdrawal is no longer awaiting review.');
+    if (w.status !== 'pending') {
+  throw new Error(
+    w.status === 'processing'
+      ? 'This withdrawal is under fraud/security review. Resolve that review before taking another action.'
+      : 'This withdrawal is no longer awaiting review.'
+  );
+  }
     if (action === 'approve' || action === 'force_approve') {
       if (action === 'force_approve' && reason.length < 10) throw new Error('Force-approval requires a reason of at least 10 characters.');
       await reqRef.update({ status:'approved', payoutStatus:'approved_awaiting_manual_payout', payoutNotice:'Admin approved this request; bank payout must be completed and confirmed separately.', approvedAt:Date.now(), approvedBy:actor.uid, ...(action === 'force_approve' ? {forceApprovedBy:actor.uid, forceApproveReason:reason} : {}) });
