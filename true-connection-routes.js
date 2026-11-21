@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 // MudyHub True Connection — server-enforced routes (Express + Firebase Admin SDK)
 //
 // Mount in server.js AFTER authenticatedUid / requireAdmin / writeAudit are defined:
@@ -30,6 +31,26 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
   const MAX_INCOMING_PENDING = 5;
   const POOL_LIMIT = 400;
   const REQUIRE_VERIFIED = String(process.env.TC_REQUIRE_VERIFIED || 'true') !== 'false';
+  // V2 features (prompts, prompt-comments, first-message rule). Off unless TC_V2_ENABLED=true.
+  const V2 = String(process.env.TC_V2_ENABLED || 'false') === 'true';
+  const FIRST_MESSAGE_MS = 48 * 60 * 60 * 1000;
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const DAILY_REQUEST_LIMIT = Math.max(1, Number(process.env.TC_DAILY_REQUEST_LIMIT || 5));
+  const PROMPT_ANSWER_MIN = 10, PROMPT_ANSWER_MAX = 150, PROMPT_COUNT = 3;
+  const PHOTO_SLOTS = 4, PHOTO_MAX_BYTES = 600 * 1024, SIGNED_URL_MS = 60 * 60 * 1000;
+  const DISCOVER_DAILY_VIEWS = 60, DISCOVER_MIN_SAME_STATE = 10, DISCOVER_PAGE = 20;
+  const DECLINE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+  // Fixed list: users choose three. Ids are stored; questions come from this list only.
+  const PROMPTS = {
+    study_tip:    'My best study tip is',
+    weekend:      'On a free weekend you will find me',
+    campus_pride: 'What I love most about my school is',
+    future:       'In five years I hope to be',
+    skill:        'A skill I am building right now is',
+    food:         'The best meal in my town is',
+    music:        'The song I keep on repeat is',
+    goal:         'Something I am proud of this year is'
+  };
 
   const val = async path => (await db.ref(path).once('value')).val();
   const clean = (v, max) => String(v == null ? '' : v).replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, max);
@@ -42,6 +63,45 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
 
   class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
   const fail = (status, message) => { throw new HttpError(status, message); };
+
+  // Prompt answers: 3 different prompts from the list, 10-150 characters, no contact details.
+  function cleanPrompts(raw, required) {
+    if (raw === undefined || raw === null) { if (required) fail(400, 'Choose your three prompts.'); return []; }
+    if (!Array.isArray(raw)) fail(400, 'Prompts are not valid.');
+    if (raw.length > PROMPT_COUNT) fail(400, 'Choose no more than three prompts.');
+    const seen = new Set(), out = [];
+    for (const item of raw) {
+      const id = clean(item && item.id, 40), answer = clean(item && item.answer, PROMPT_ANSWER_MAX);
+      if (!Object.prototype.hasOwnProperty.call(PROMPTS, id)) fail(400, 'Choose prompts from the list.');
+      if (seen.has(id)) fail(400, 'Each prompt can only be chosen once.');
+      if (answer.length < PROMPT_ANSWER_MIN) fail(400, `Each prompt answer needs at least ${PROMPT_ANSWER_MIN} characters.`);
+      if (CONTACT_RE.test(answer)) fail(400, 'Do not include phone numbers, emails, links or handles in prompt answers.');
+      seen.add(id); out.push({ id, question: PROMPTS[id], answer });
+    }
+    if (required && out.length !== PROMPT_COUNT) fail(400, `Answer exactly ${PROMPT_COUNT} prompts.`);
+    return out;
+  }
+
+  // Location is stored as free text, e.g. "Kano, Kano". The state is the last part.
+  const stateOf = loc => String(loc || '').split(',').pop().trim().toLowerCase();
+  // Photos are private files; the app receives a link that expires after one hour.
+  async function photoLinkFor(profile) {
+    const first = Array.isArray(profile && profile.photos) ? [...profile.photos].sort((a, b) => a.slot - b.slot)[0] : null;
+    const bucketName = process.env.FIREBASE_STORAGE_BUCKET;
+    if (!first || !first.path || !bucketName) return '';
+    const [url] = await admin.storage().bucket(bucketName).file(first.path).getSignedUrl({ action: 'read', expires: now() + SIGNED_URL_MS });
+    return url;
+  }
+
+  // Pending first-message deadline: if the accepter never writes, the connection closes.
+  async function expireUnopenedConnection(c) {
+    if (!c || c.status !== 'active' || c.awaitingFirstMessage !== true) return false;
+    if (Number(c.firstMessageDeadline || 0) > now()) return false;
+    const opened = await val(`messages/tc_${c.id}`);
+    if (opened) { await db.ref(`trueConnections/${c.id}/awaitingFirstMessage`).set(false); return false; }
+    await closeConnection(c.id, 'first_message_timeout');
+    return true;
+  }
   const route = (path, handler) => app.post(path, async (req, res) => {
     try {
       const uid = await authenticatedUid(req).catch(() => null);
@@ -89,7 +149,7 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
     const authRecord = await admin.auth().getUser(uid).catch(() => null);
     if (!authRecord || authRecord.disabled) fail(403, 'Your account is unavailable.');
     if (!authRecord.emailVerified) fail(403, 'Verify your email address before joining True Connection.');
-    const verified = user.verified === true || user.kycStatus === 'approved' || user.kycStatus === 'verified';
+    const verified = user.identityStatus === 'approved';
     if (REQUIRE_VERIFIED && !verified) fail(403, 'Complete MudyHub account verification first (Profile → Verification), then come back.');
     if (existing && existing.approval === 'rejected') fail(403, 'Your True Connection application was not approved. Contact Support if you think this is a mistake.');
     const band = ageBandFromDob(body.dob);
@@ -114,6 +174,7 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
       uid, active: b.active !== false, ageBand: e.ageBand,
       bio: clean(b.bio, 160), about: clean(b.about, 500), intentions: clean(b.intentions, 160),
       values: clean(b.values, 160), interests: clean(b.interests, 160), location: clean(b.location, 80),
+      prompts: V2 ? cleanPrompts(b.prompts, true) : [],
       communication: COMM.includes(b.communication) ? b.communication : 'any',
       agePreference: AGE_PREF.includes(b.agePreference) ? b.agePreference : 'any',
       locationPreference: LOC_PREF.includes(b.locationPreference) ? b.locationPreference : 'any',
@@ -127,6 +188,9 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
     p.avatarUrl = clean((user && (user.avatarUrl || user.profilePic)) || '', 2000);
     if (!/^(https?:\/\/|data:image\/)/i.test(p.avatarUrl)) p.avatarUrl = '';
     if (p.avatarUrl.length > 1500 && p.avatarUrl.startsWith('data:')) p.avatarUrl = ''; // avoid huge data URLs in shortlists
+    // Keep photos that were uploaded separately; saving the text fields must not remove them.
+    const prevProfile = (await val(`trueConnectionProfiles/${uid}`)) || {};
+    p.photos = Array.isArray(prevProfile.photos) ? prevProfile.photos : [];
     await db.ref(`trueConnectionProfiles/${uid}`).set(p);
     if (!p.active) await db.ref(`trueConnectionRecommendations/${uid}`).remove();
     return { profile: p, hasLive: !!live };
@@ -148,7 +212,7 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
   const publicCard = (uid, p) => ({
     uid, avatarUrl: p.avatarUrl || '', bio: p.bio || '', about: p.about || '', intentions: p.intentions || '',
     values: p.values || '', interests: p.interests || '', ageBand: p.ageBand || '', location: p.location || '',
-    communication: p.communication || 'any'
+    communication: p.communication || 'any', prompts: Array.isArray(p.prompts) ? p.prompts : []
   });
 
   route('/api/tc/recommend', async (uid, b) => {
@@ -197,7 +261,8 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
     const target = clean(b.targetUid, 128);
     if (!target || target === uid) fail(400, 'Invalid selection.');
     const recs = await val(`trueConnectionRecommendations/${uid}`);
-    if (!recs || !recs.candidates || !recs.candidates[target]) fail(403, 'You can only approach one of your three recommendations.');
+    const shown = await val(`tcDiscoverShown/${uid}/${target}`);
+    if (!shown && (!recs || !recs.candidates || !recs.candidates[target])) fail(403, 'You can only approach people you were shown in Recommendations or Discover.');
     if (await val(`trueConnectionLive/${uid}`)) fail(409, 'You already have an active or resolving connection.');
     if (!(await eligibilityOf(target))) fail(409, 'This member is no longer available.');
     if (await val(`trueConnectionLive/${target}`)) fail(409, 'This member is no longer available.');
@@ -206,13 +271,26 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
       db.ref('trueConnectionRequests').orderByChild('fromUid').equalTo(uid).once('value'),
       db.ref('trueConnectionRequests').orderByChild('toUid').equalTo(target).once('value')
     ]);
+    const outAll = Object.values(out.val() || {});
+    const sentToday = outAll.filter(r => Number(r.createdAt || 0) > now() - DAY_MS).length;
+    if (sentToday >= DAILY_REQUEST_LIMIT) fail(429, `You can send up to ${DAILY_REQUEST_LIMIT} requests in 24 hours. Try again later.`);
+    let promptId = null, comment = null;
+    if (V2 && b.comment !== undefined && b.comment !== null && String(b.comment).trim() !== '') {
+      const tp = await val(`trueConnectionProfiles/${target}`);
+      promptId = clean(b.promptId, 40);
+      const hit = Array.isArray(tp && tp.prompts) && tp.prompts.find(p => p.id === promptId);
+      if (!hit) fail(400, 'Comment on one of their prompt answers.');
+      comment = clean(b.comment, 150);
+      if (comment.length < 3) fail(400, 'Write a short comment (at least 3 characters).');
+      if (CONTACT_RE.test(comment)) fail(400, 'Do not include phone numbers, emails, links or handles in comments.');
+    }
     const outPending = Object.values(out.val() || {}).filter(r => r.status === 'pending');
     if (outPending.length) fail(409, 'You already have a pending request. Cancel it to approach someone else.');
     const incPending = Object.values(inc.val() || {}).filter(r => r.status === 'pending');
     if (incPending.some(r => r.fromUid === uid)) fail(409, 'Request already sent.');
     if (incPending.length >= MAX_INCOMING_PENDING) fail(409, 'This member is not available right now.');
     const rid = db.ref('trueConnectionRequests').push().key;
-    await db.ref(`trueConnectionRequests/${rid}`).set({ id: rid, fromUid: uid, toUid: target, status: 'pending', createdAt: now() });
+    await db.ref(`trueConnectionRequests/${rid}`).set({ id: rid, fromUid: uid, toUid: target, status: 'pending', createdAt: now(), ...(comment ? { promptId, comment } : {}) });
     await db.ref(`notifications/${target}`).push({ type: 'true_connection_request', requestId: rid, message: 'Someone would like to connect with you on True Connection.', createdAt: now(), read: false });
     return { requestId: rid };
   });
@@ -260,9 +338,13 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
       const [a, bb] = [r.fromUid, uid].sort();
       const t = now();
       const participants = { [r.fromUid]: true, [uid]: true };
+      const firstDeadline = t + FIRST_MESSAGE_MS;
+      const opener = (V2 && r.comment) ? { promptId: r.promptId || null, comment: r.comment } : null;
       await db.ref().update({
-        [`trueConnections/${connId}`]: { id: connId, userA: a, userB: bb, participants, status: 'active', startedAt: t, requestId: rid },
-        [`chatMembers/tc_${connId}`]: { connectionId: connId, members: participants, userA: a, userB: bb, createdAt: t },
+        [`trueConnections/${connId}`]: { id: connId, userA: a, userB: bb, participants, status: 'active', startedAt: t, requestId: rid,
+          ...(V2 ? { awaitingFirstMessage: true, firstMessageBy: uid, firstMessageDeadline: firstDeadline, opener } : {}) },
+        [`chatMembers/tc_${connId}`]: { connectionId: connId, members: participants, userA: a, userB: bb, createdAt: t,
+          ...(V2 ? { firstMessageBy: uid, firstMessageDeadline: firstDeadline } : {}) },
         [`userChats/${r.fromUid}/tc_${connId}`]: { isTrueConnection: true, otherUid: uid, lastMessageText: 'True Connection started', lastMessageAt: t, lastMessageBy: 'system', read: false },
         [`userChats/${uid}/tc_${connId}`]: { isTrueConnection: true, otherUid: r.fromUid, lastMessageText: 'True Connection started', lastMessageAt: t, lastMessageBy: 'system', read: false },
         [`trueConnectionRequests/${rid}/status`]: 'accepted',
@@ -310,6 +392,7 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
     if (!c || !c.participants || c.participants[uid] !== true) fail(404, 'Connection not found.');
     if (c.status === 'ending' && Number(c.endsAt || 0) <= now()) { await closeConnection(c.id, 'resolution_period_complete'); fail(409, 'This connection has ended.'); }
     if (c.status === 'closed') fail(409, 'This connection has ended.');
+    if (await expireUnopenedConnection(c)) fail(409, 'This connection closed because the first message was not sent within 48 hours.');
     return c;
   }
 
@@ -353,9 +436,190 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
   });
 
   // ---------------------------------------------------------------- state (single read for the UI)
+  // ---------------------------------------------------------------- privacy: connection details
+  // Only an active or resolving participant can read the other person's first name and photo.
+  // The surname, date of birth, phone, email and any reports are never returned.
+  route('/api/tc/connection', async (uid, b) => {
+    const c = await loadConnection(uid, b.connectionId);
+    if (c.status !== 'active' && c.status !== 'ending') fail(409, 'This connection is not active.');
+    const other = c.userA === uid ? c.userB : c.userA;
+    const u = (await val(`users/${other}`)) || {};
+    const full = String(u.fullName || u.fullname || u.username || 'Member').trim();
+    const firstName = (full.split(/\s+/)[0] || 'Member').slice(0, 30);
+    const p = (await val(`trueConnectionProfiles/${other}`)) || {};
+    let avatarUrl = clean(p.avatarUrl || '', 2000);
+    if (!/^(https?:\/\/|data:image\/)/i.test(avatarUrl) || avatarUrl.length > 1500) avatarUrl = '';
+    return { id: c.id, chatId: `tc_${c.id}`, otherUid: other, firstName, avatarUrl };
+  });
+
+  // ---------------------------------------------------------------- privacy: export my data
+  route('/api/tc/data/export', async uid => {
+    const [elig, profile, sent, received, conns] = await Promise.all([
+      val(`trueConnectionEligibility/${uid}`),
+      val(`trueConnectionProfiles/${uid}`),
+      db.ref('trueConnectionRequests').orderByChild('fromUid').equalTo(uid).once('value'),
+      db.ref('trueConnectionRequests').orderByChild('toUid').equalTo(uid).once('value'),
+      db.ref('trueConnections').orderByChild('userA').equalTo(uid).once('value')
+    ]);
+    const mine = snap => Object.values(snap.val() || {}).map(r => ({ id: r.id, status: r.status, createdAt: r.createdAt }));
+    const connsB = await db.ref('trueConnections').orderByChild('userB').equalTo(uid).once('value');
+    const connections = [...Object.values(conns.val() || {}), ...Object.values(connsB.val() || {})]
+      .map(c => ({ id: c.id, status: c.status, startedAt: c.startedAt, closedAt: c.closedAt || null, closedReason: c.closedReason || null }));
+    return {
+      exportedAt: now(),
+      eligibility: elig ? { ageBand: elig.ageBand, approval: elig.approval, appliedAt: elig.appliedAt, rulesAcceptedAt: elig.rulesAcceptedAt } : null,
+      profile: profile ? { bio: profile.bio, about: profile.about, intentions: profile.intentions, values: profile.values, interests: profile.interests, location: profile.location, communication: profile.communication, agePreference: profile.agePreference, locationPreference: profile.locationPreference, prompts: profile.prompts || [] } : null,
+      requestsSent: mine(sent),
+      requestsReceived: mine(received),
+      connections
+    };
+  });
+
+  // ---------------------------------------------------------------- privacy: delete my True Connection data
+  // Removes my profile, prompts, recommendations and pending requests, and closes any open connection.
+  // The other person's chat history is kept only as a closed record. A suspension is kept so it cannot be bypassed.
+  route('/api/tc/data/delete', async (uid, b) => {
+    if (b.confirm !== 'DELETE') fail(400, 'Type DELETE to confirm.');
+    const live = await val(`trueConnectionLive/${uid}`);
+    if (live) {
+      const c = await val(`trueConnections/${live}`);
+      if (c && c.status !== 'closed') await closeConnection(live, 'member_deleted_data', uid);
+      await releaseLive(uid, live);
+    }
+    await cancelPendingFor([uid], null);
+    const elig = (await val(`trueConnectionEligibility/${uid}`)) || {};
+    await db.ref().update({
+      [`trueConnectionProfiles/${uid}`]: null,
+      [`trueConnectionRecommendations/${uid}`]: null,
+      [`trueConnectionEligibility/${uid}`]: { eligible: false, suspended: elig.suspended === true, dataDeletedAt: now(), approval: elig.approval || 'none' }
+    });
+    return { deleted: true, message: 'Your True Connection profile, prompts and pending requests were removed. Any open connection was closed.' };
+  });
+
+  // ---------------------------------------------------------------- photos (private storage, up to four)
+  route('/api/tc/photos/upload', async (uid, b) => {
+    await requireEligible(uid);
+    const slot = Number(b.slot);
+    if (!Number.isInteger(slot) || slot < 0 || slot >= PHOTO_SLOTS) fail(400, 'Choose a photo slot from 1 to 4.');
+    const m = /^data:(image\/(?:jpeg|png));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.dataUrl || ''));
+    if (!m) fail(400, 'Upload a JPEG or PNG photo.');
+    const buf = Buffer.from(m[2], 'base64');
+    if (buf.length > PHOTO_MAX_BYTES) fail(400, 'That photo is too large. Use one under 600 KB.');
+    const bucketName = process.env.FIREBASE_STORAGE_BUCKET;
+    if (!bucketName) fail(500, 'Photo storage is not configured yet.');
+    const existing = (await val(`trueConnectionProfiles/${uid}/photos`)) || [];
+    const old = existing.find(p => p.slot === slot);
+    const ext = m[1].endsWith('png') ? 'png' : 'jpg';
+    const path = `tcPhotos/${uid}/${crypto.randomUUID()}.${ext}`;
+    const bucket = admin.storage().bucket(bucketName);
+    await bucket.file(path).save(buf, { resumable: false, contentType: m[1], metadata: { cacheControl: 'private, max-age=0' } });
+    const next = existing.filter(p => p.slot !== slot).concat([{ slot, path, uploadedAt: now() }]).sort((x, y) => x.slot - y.slot);
+    await db.ref(`trueConnectionProfiles/${uid}/photos`).set(next);
+    if (old && old.path) await bucket.file(old.path).delete().catch(() => {});
+    return { slot, count: next.length };
+  });
+
+  route('/api/tc/photos/remove', async (uid, b) => {
+    await requireEligible(uid);
+    const slot = Number(b.slot);
+    const existing = (await val(`trueConnectionProfiles/${uid}/photos`)) || [];
+    const gone = existing.find(p => p.slot === slot);
+    if (!gone) fail(404, 'No photo in that slot.');
+    const left = existing.filter(p => p.slot !== slot);
+    await db.ref(`trueConnectionProfiles/${uid}/photos`).set(left.length ? left : null);
+    const bucketName = process.env.FIREBASE_STORAGE_BUCKET;
+    if (bucketName && gone.path) await admin.storage().bucket(bucketName).file(gone.path).delete().catch(() => {});
+    return { count: left.length };
+  });
+
+  // ---------------------------------------------------------------- Discover (browse, curated)
+  // Shows verified-eligible members with a photo, prompts and an active profile.
+  // Same state first; nationwide only when the state pool is small, and labelled as outside your state.
+  route('/api/tc/discover', async (uid, b) => {
+    await requireEligible(uid);
+    const me = await val(`trueConnectionProfiles/${uid}`);
+    if (!me || me.active === false) fail(409, 'Save your profile before using Discover.');
+    if (!Array.isArray(me.photos) || !me.photos.length) fail(409, 'Add at least one photo before using Discover.');
+    const day = new Date().toISOString().slice(0, 10);
+    const used = Number((await val(`tcDiscoverViews/${uid}/${day}`)) || 0);
+    if (used >= DISCOVER_DAILY_VIEWS) fail(429, "You have reached today's Discover limit. It resets tomorrow.");
+
+    const myState = stateOf(me.location);
+    const allProfiles = (await val('trueConnectionProfiles')) || {};
+    const allElig = (await val('trueConnectionEligibility')) || {};
+    const myBlocks = (await val(`blocks/${uid}`)) || {};
+    const cutoff = now() - DECLINE_WINDOW_MS;
+
+    const pool = [];
+    for (const [other, p] of Object.entries(allProfiles)) {
+      if (!p || other === uid || p.active === false) continue;
+      if (!Array.isArray(p.photos) || !p.photos.length) continue;
+      if (!Array.isArray(p.prompts) || !p.prompts.length) continue;
+      const e = allElig[other];
+      if (!e || e.eligible !== true || e.suspended === true || e.approval === 'rejected') continue;
+      if (myBlocks[other] === true) continue;
+      if (!b.nationwide && stateOf(p.location) !== myState) continue;
+      pool.push({ other, p });
+    }
+
+    // Widen to nationwide only when the local pool is small (or the member asked for it).
+    let rows = pool;
+    let widened = false;
+    const sameState = pool.filter(x => stateOf(x.p.location) === myState);
+    if (b.nationwide === true || sameState.length < DISCOVER_MIN_SAME_STATE) {
+      if (!b.nationwide) {
+        widened = true;
+        for (const [other, p] of Object.entries(allProfiles)) {
+          if (!p || other === uid || p.active === false || stateOf(p.location) === myState) continue;
+          if (!Array.isArray(p.photos) || !p.photos.length || !Array.isArray(p.prompts) || !p.prompts.length) continue;
+          const e = allElig[other];
+          if (!e || e.eligible !== true || e.suspended === true || e.approval === 'rejected') continue;
+          if (myBlocks[other] === true) continue;
+          rows.push({ other, p });
+        }
+      }
+    }
+
+    const scored = [];
+    for (const { other, p } of rows) {
+      if ((await val(`blocks/${other}/${uid}`)) === true) continue;
+      const dec = Number((await val(`trueConnectionDeclines/${pairKey(uid, other)}`)) || 0);
+      if (dec && dec > cutoff) continue;
+      const score = overlap(split(me.interests), split(p.interests)) * 3
+        + overlap(split(me.values), split(p.values)) * 4
+        + overlap(split(me.intentions), split(p.intentions)) * 2
+        + (stateOf(p.location) === myState ? 2 : 0)
+        + (me.agePreference === 'any' || me.agePreference === p.ageBand ? 1 : 0);
+      scored.push({ other, p, score, outsideState: stateOf(p.location) !== myState });
+    }
+    scored.sort((a, b2) => b2.score - a.score);
+    const page = scored.slice(0, Math.min(DISCOVER_PAGE, DISCOVER_DAILY_VIEWS - used));
+
+    const cards = [];
+    for (const { other, p, outsideState } of page) {
+      await db.ref(`tcDiscoverShown/${uid}/${other}`).set(now());
+      cards.push({
+        uid: other,
+        photoUrl: await photoLinkFor(p),
+        bio: clean(p.bio, 160),
+        about: clean(p.about, 300),
+        ageBand: p.ageBand || '',
+        state: stateOf(p.location),
+        outsideState,
+        communication: p.communication || 'any',
+        interests: clean(p.interests, 160),
+        values: clean(p.values, 160),
+        intentions: clean(p.intentions, 160),
+        prompts: (p.prompts || []).map(x => ({ id: x.id, question: x.question, answer: x.answer }))
+      });
+    }
+    if (cards.length) await db.ref(`tcDiscoverViews/${uid}/${day}`).set(used + cards.length);
+    return { cards, widened, sameStatePool: sameState.length, remainingToday: Math.max(0, DISCOVER_DAILY_VIEWS - used - cards.length) };
+  });
+
   route('/api/tc/state', async uid => {
     const [elig, user] = await Promise.all([val(`trueConnectionEligibility/${uid}`), val(`users/${uid}`)]);
-    const verified = !!user && (user.verified === true || user.kycStatus === 'approved' || user.kycStatus === 'verified');
+    const verified = !!user && user.identityStatus === 'approved';
     const base = { rulesVersion: RULES_VERSION, accountVerified: verified, requireVerified: REQUIRE_VERIFIED };
     if (elig && elig.approval === 'pending' && elig.rulesVersion === RULES_VERSION) return { ...base, stage: 'pending' };
     if (elig && elig.approval === 'rejected') return { ...base, stage: 'rejected' };
@@ -369,9 +633,10 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
       if (c && c.status === 'ending' && Number(c.endsAt || 0) <= now()) { await closeConnection(liveId, 'resolution_period_complete'); liveId = null; }
       else if (!c || c.status === 'closed') { await releaseLive(uid, liveId); liveId = null; }
       else {
+        if (await expireUnopenedConnection(c)) { liveId = null; return { ...base, stage: 'join' }; }
         const other = c.userA === uid ? c.userB : c.userA;
         const decisions = (await val(`trueConnectionDecisions/${liveId}`)) || {};
-        return { ...base, stage: 'connected', connection: { id: liveId, chatId: `tc_${liveId}`, status: c.status, endsAt: c.endsAt || null, endedBy: c.endedBy || null, otherUid: other, iContinued: decisions[uid] === 'continue', theyContinued: decisions[other] === 'continue', startedAt: c.startedAt } };
+        return { ...base, stage: 'connected', connection: { id: liveId, chatId: `tc_${liveId}`, awaitingFirstMessage: c.awaitingFirstMessage === true, firstMessageBy: c.firstMessageBy || null, firstMessageDeadline: c.firstMessageDeadline || null, opener: c.opener || null, status: c.status, endsAt: c.endsAt || null, endedBy: c.endedBy || null, otherUid: other, iContinued: decisions[uid] === 'continue', theyContinued: decisions[other] === 'continue', startedAt: c.startedAt } };
       }
     }
     const [profile, recs, outSnap, inSnap] = await Promise.all([
@@ -383,7 +648,7 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
     const incoming = [];
     for (const r of Object.values(inSnap.val() || {}).filter(r => r.status === 'pending')) {
       const p = await val(`trueConnectionProfiles/${r.fromUid}`);
-      if (p && (await eligibilityOf(r.fromUid))) incoming.push({ id: r.id, createdAt: r.createdAt, card: publicCard(r.fromUid, p) }); // no name before mutual acceptance
+      if (p && (await eligibilityOf(r.fromUid))) incoming.push({ id: r.id, createdAt: r.createdAt, card: publicCard(r.fromUid, p), ...(r.comment ? { comment: r.comment, promptQuestion: PROMPTS[r.promptId] || '' } : {}) }); // no name before mutual acceptance
     }
     // recommendations stale if a candidate got connected/blocked since
     let candidates = [];

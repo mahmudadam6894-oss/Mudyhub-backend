@@ -10,6 +10,7 @@ import registerTasks from './tasks-routes.js';
 import registerRewards from './rewards-routes.js';
 import registerBusiness from './business-routes.js';
 import registerJobs from './jobs-routes.js';
+import registerVerification from './verification-routes.js';
 import {
   Document, Packer, Paragraph, TextRun, AlignmentType, ImageRun,
   PageBreak, Footer, PageNumber, HeadingLevel, NumberFormat, TableOfContents, TabStopType, LeaderType
@@ -1259,6 +1260,29 @@ app.post('/api/siwes', async (req, res) => {
           } catch (e) { console.error("Logo image error:", e); }
         }
 
+      }
+
+      const chHeads = [];
+      for (const item of ch.items) {
+        if (item.type === "official") {
+          if (ch.num === 2 || ch.num === 3) chHeads.push({ at: children.length, text: item.text });
+          children.push(docxSubheading(item.text));
+        } else if (item.type === "minor") {
+          if (ch.num === 2 || ch.num === 3) chHeads.push({ at: children.length, text: item.text });
+          children.push(docxPara(item.text, { bold: true, afterSpacing: 100 }));
+        } else if (item.type === "bullet") {
+          // 🚨 FIXED: Renders real Word bullet points
+          children.push(new Paragraph({
+            text: item.text,
+            bullet: { level: 0 },
+            spacing: { after: 120, line: 360 },
+            style: "Normal"
+          }));
+        } else {
+          children.push(docxPara(item.text));
+        }
+      }
+
         // Place each photo under the heading the student chose (Chapter 2 chart; Chapter 3 by month).
         const figPhoto = f => {
           const out = [];
@@ -1283,28 +1307,6 @@ app.post('/api/siwes', async (req, res) => {
         }
         inserts.sort((x, y) => y.at - x.at).forEach(ins => children.splice(ins.at, 0, ...ins.items));
         figTable.filter(f => f.rank[0] === ch.num && !placed.has(f)).forEach(f => figPhoto(f).forEach(el => children.push(el)));
-      }
-
-      const chHeads = [];
-      for (const item of ch.items) {
-        if (item.type === "official") {
-          if (ch.num === 2 || ch.num === 3) chHeads.push({ at: children.length, text: item.text });
-          children.push(docxSubheading(item.text));
-        } else if (item.type === "minor") {
-          if (ch.num === 2 || ch.num === 3) chHeads.push({ at: children.length, text: item.text });
-          children.push(docxPara(item.text, { bold: true, afterSpacing: 100 }));
-        } else if (item.type === "bullet") {
-          // 🚨 FIXED: Renders real Word bullet points
-          children.push(new Paragraph({
-            text: item.text,
-            bullet: { level: 0 },
-            spacing: { after: 120, line: 360 },
-            style: "Normal"
-          }));
-        } else {
-          children.push(docxPara(item.text));
-        }
-      }
 
       if (ch.num === 5) {
         children.push(docxSubheading("d. References"));
@@ -1850,6 +1852,7 @@ registerTasks({ app, admin, db, authenticatedUid });
 registerRewards({ app, admin, db, authenticatedUid });
 registerBusiness({ app, admin, db, authenticatedUid, requireAdmin, writeAudit });
 registerJobs({ app, admin, db, authenticatedUid });
+registerVerification({ app, admin, db, authenticatedUid, requireAdmin, writeAudit });
 app.get("/api/payment-config", async (req, res) => {
   const keys = paystackKeys();
   if (!keys.publicKey) return res.status(503).json({ error: `Paystack ${keys.mode} public key is not configured (it must start with pk_${keys.mode}_).` });

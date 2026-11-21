@@ -1168,6 +1168,13 @@ export default function registerAdminV1({
       );
     }
 
+    // A previous attempt may have stopped part-way and left the payout "paying" with another reference.
+    if (initial.status === 'paying' && initial.payoutReference && initial.payoutReference !== reference && b.resumeStuck !== true) {
+      throw new Error(
+        `A previous payout attempt is recorded with reference "${initial.payoutReference}". If that transfer was made, enter that same reference. If you need to replace it, confirm "Resume stuck payout" and try again.`
+      );
+    }
+
     if (initial.status === 'paid') {
       if (initial.payoutReference !== reference) {
         throw new Error(
@@ -1192,6 +1199,21 @@ export default function registerAdminV1({
           payoutReference: reference,
           payingAt: Date.now(),
           payingBy: actor.uid
+        };
+      }
+
+      if (
+        current.status === 'paying' &&
+        actor.role === 'super_admin' &&
+        (current.payoutReference === reference || b.resumeStuck === true)
+      ) {
+        return {
+          ...current,
+          payoutReference: reference,
+          payingBy: actor.uid,
+          payingAt: Date.now(),
+          resumedFrom: current.payoutReference || null,
+          lastPaymentRetryAt: Date.now()
         };
       }
 
@@ -1260,7 +1282,9 @@ export default function registerAdminV1({
       'mark_withdrawal_paid',
       'withdrawal',
       id,
-      `Manual bank payout confirmed. Reference: ${reference}`,
+      w.resumedFrom
+        ? `Stuck payout resumed by super admin. Earlier attempt reference: ${w.resumedFrom}. Confirmed reference: ${reference}`
+        : `Manual bank payout confirmed. Reference: ${reference}`,
       { status: 'approved' },
       {
         status: 'paid',
