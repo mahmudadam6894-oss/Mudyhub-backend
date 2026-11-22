@@ -26,10 +26,15 @@ export default function registerVerification({ app, admin, db, authenticatedUid,
   };
   const ninHash = nin => {
     const secret = process.env.VERIFICATION_HASH_SECRET;
-    if (!secret) throw fail(500, "Verification is not configured yet. Please try again later.");
+    if (!secret) throw fail(503, "Identity verification is not set up on the server yet (missing VERIFICATION_HASH_SECRET). Please try again later.");
     return crypto.createHmac("sha256", secret).update(nin).digest("hex");
   };
   // A file key the storage routes issued to this user: verification/{uid}/{uuid}.{ext}
+  // Checks a stored file, but turns storage errors into a clear message (not a silent failure).
+  async function fileExists(key) {
+    try { return await headObject(key); }
+    catch (e) { console.error("[verification] storage check failed:", e.message); throw fail(503, "File storage is unavailable right now. Please try again in a few minutes."); }
+  }
   const isOwnKey = (key, uid) => new RegExp(`^verification\\/${uid}\\/[A-Za-z0-9-]{36}\\.(jpg|png|pdf)$`).test(key);
 
   // ---------- status ----------
@@ -81,10 +86,10 @@ export default function registerVerification({ app, admin, db, authenticatedUid,
 
       // The document must be a file this user uploaded through the storage routes, and it must really be there.
       if (!isOwnKey(documentKey, uid)) throw fail(400, "Upload your identity document first.");
-      if (!(await headObject(documentKey))) throw fail(400, "Your identity document was not received. Please upload it again.");
+      if (!(await fileExists(documentKey))) throw fail(400, "Your identity document was not received. Please upload it again.");
       if (selfieKey) {
         if (!isOwnKey(selfieKey, uid)) throw fail(400, "Selfie upload is invalid.");
-        if (!(await headObject(selfieKey))) throw fail(400, "Your selfie was not received. Please upload it again.");
+        if (!(await fileExists(selfieKey))) throw fail(400, "Your selfie was not received. Please upload it again.");
       }
 
       // One NIN, one account.
