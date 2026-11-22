@@ -11,6 +11,7 @@ import registerRewards from './rewards-routes.js';
 import registerBusiness from './business-routes.js';
 import registerJobs from './jobs-routes.js';
 import registerVerification from './verification-routes.js';
+import registerStorage from './storage-routes.js';
 import {
   Document, Packer, Paragraph, TextRun, AlignmentType, ImageRun,
   PageBreak, Footer, PageNumber, HeadingLevel, NumberFormat, TableOfContents, TabStopType, LeaderType
@@ -1853,6 +1854,7 @@ registerRewards({ app, admin, db, authenticatedUid });
 registerBusiness({ app, admin, db, authenticatedUid, requireAdmin, writeAudit });
 registerJobs({ app, admin, db, authenticatedUid });
 registerVerification({ app, admin, db, authenticatedUid, requireAdmin, writeAudit });
+registerStorage({ app, admin, db, authenticatedUid, requireAdmin });
 app.get("/api/payment-config", async (req, res) => {
   const keys = paystackKeys();
   if (!keys.publicKey) return res.status(503).json({ error: `Paystack ${keys.mode} public key is not configured (it must start with pk_${keys.mode}_).` });
