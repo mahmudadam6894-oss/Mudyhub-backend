@@ -620,7 +620,7 @@ export default function registerTrueConnection({ app, admin, db, authenticatedUi
   route('/api/tc/state', async uid => {
     const [elig, user] = await Promise.all([val(`trueConnectionEligibility/${uid}`), val(`users/${uid}`)]);
     const verified = !!user && user.identityStatus === 'approved';
-    const base = { rulesVersion: RULES_VERSION, accountVerified: verified, requireVerified: REQUIRE_VERIFIED };
+    const base = { rulesVersion: RULES_VERSION, accountVerified: verified, requireVerified: REQUIRE_VERIFIED, identityStatus: user.identityStatus || 'none' };
     if (elig && elig.approval === 'pending' && elig.rulesVersion === RULES_VERSION) return { ...base, stage: 'pending' };
     if (elig && elig.approval === 'rejected') return { ...base, stage: 'rejected' };
     if (!elig || elig.eligible !== true || elig.rulesVersion !== RULES_VERSION) return { ...base, stage: 'join' };
