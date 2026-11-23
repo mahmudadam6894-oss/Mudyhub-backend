@@ -20,7 +20,7 @@ const RULES = {
     "status-image":        { prefix: "status",       types: ["image/jpeg"],                                 max: 6 * MB, public: true },
     "status-video":        { prefix: "status",       types: ["video/mp4", "video/webm", "video/quicktime"], max: 4 * MB, public: true },
     "status-audio":        { prefix: "status",       types: ["audio/webm", "audio/mp4", "audio/ogg"],       max: 2.5 * MB, public: true },
-    "post-media":          { prefix: "posts",        types: ["image/jpeg", "video/mp4", "video/webm"],      max: 7 * MB, public: true },
+    "post-media":          { prefix: "posts",        types: ["image/jpeg", "video/mp4", "video/webm", "video/quicktime"], max: 7 * MB, public: true },
     "avatar":              { prefix: "avatars",      types: ["image/jpeg", "image/png"],                    max: 2 * MB,   public: true },
     "campus-slip":         { prefix: "campus",       types: ["image/jpeg", "image/png", "application/pdf"], max: 5 * MB,   adminPerm: "campus" },
     "earning-proof":       { prefix: "proofs",       types: ["image/jpeg", "image/png", "image/webp"],      max: 5 * MB,   adminPerm: "tasks" },
