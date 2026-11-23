@@ -17,16 +17,24 @@ const RULES = {
     "verification-doc":    { prefix: "verification", types: ["image/jpeg", "image/png", "application/pdf"], max: 5 * MB,   adminPerm: "verification" },
     "verification-selfie": { prefix: "verification", types: ["image/jpeg", "image/png"],                    max: 5 * MB,   adminPerm: "verification" },
     "tc-photo":            { prefix: "tc-photos",    types: ["image/jpeg", "image/png"],                    max: 600 * 1024 },
-    "status-image":        { prefix: "status",       types: ["image/jpeg"],                                 max: 6 * MB },
-    "status-video":        { prefix: "status",       types: ["video/mp4", "video/webm"],                    max: 4 * MB },
-    "status-audio":        { prefix: "status",       types: ["audio/webm", "audio/mp4", "audio/ogg"],       max: 2.5 * MB },
-    "post-media":          { prefix: "posts",        types: ["image/jpeg", "video/mp4", "video/webm"],      max: 7 * MB }
+    "status-image":        { prefix: "status",       types: ["image/jpeg"],                                 max: 6 * MB, public: true },
+    "status-video":        { prefix: "status",       types: ["video/mp4", "video/webm", "video/quicktime"], max: 4 * MB, public: true },
+    "status-audio":        { prefix: "status",       types: ["audio/webm", "audio/mp4", "audio/ogg"],       max: 2.5 * MB, public: true },
+    "post-media":          { prefix: "posts",        types: ["image/jpeg", "video/mp4", "video/webm"],      max: 7 * MB, public: true },
+    "avatar":              { prefix: "avatars",      types: ["image/jpeg", "image/png"],                    max: 2 * MB,   public: true },
+    "campus-slip":         { prefix: "campus",       types: ["image/jpeg", "image/png", "application/pdf"], max: 5 * MB,   adminPerm: "campus" },
+    "earning-proof":       { prefix: "proofs",       types: ["image/jpeg", "image/png", "image/webp"],      max: 5 * MB,   adminPerm: "tasks" },
+    "business-doc":        { prefix: "business",     types: ["image/jpeg", "image/png", "application/pdf"], max: 5 * MB,   adminPerm: "business" },
+    "siwes-report":        { prefix: "siwes",        types: ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"], max: 10 * MB }
 };
 const EXT = {
-    "image/jpeg": "jpg", "image/png": "png", "application/pdf": "pdf",
-    "video/mp4": "mp4", "video/webm": "webm", "audio/webm": "webm", "audio/mp4": "m4a", "audio/ogg": "ogg"
+    "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "application/pdf": "pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov", "audio/webm": "webm", "audio/mp4": "m4a", "audio/ogg": "ogg"
 };
 const SAFE_KEY = /^[a-z-]+\/[A-Za-z0-9_-]{6,128}\/[A-Za-z0-9-]{36}\.[a-z0-9]{2,4}$/;
+// Who may view a file. Public media (statuses, posts, avatars) is visible to any verified signed-in member, for now.
+// Private files are visible to their owner and to the admin permission listed for their type.
 
 export default function registerStorage({ app, admin, db, authenticatedUid, requireAdmin }) {
     const fail = (status, message) => Object.assign(new Error(message), { status });
@@ -98,8 +106,11 @@ export default function registerStorage({ app, admin, db, authenticatedUid, requ
             const key = String((req.body || {}).key || "");
             if (!SAFE_KEY.test(key)) throw fail(400, "Invalid file.");
             const prefix = key.split("/")[0];
-            const isVerification = prefix === "verification";
-            const allowed = ownerOf(key) === uid || (isVerification && await adminCan(req, "verification"));
+            const rule = Object.values(RULES).find(r => r.prefix === prefix);
+            if (!rule) throw fail(400, "Invalid file.");
+            let allowed = ownerOf(key) === uid;
+            if (!allowed && rule.public) { await activeUser(uid); allowed = true; }
+            if (!allowed && rule.adminPerm) allowed = await adminCan(req, rule.adminPerm);
             if (!allowed) throw fail(403, "You cannot open this file.");
             const url = await presignRead(key, 300);
             return res.json({ ok: true, url, expiresIn: 300 });
