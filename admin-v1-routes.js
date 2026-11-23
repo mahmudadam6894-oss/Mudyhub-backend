@@ -666,6 +666,158 @@ export default function registerAdminV1({
   // MANUAL USER VERIFICATION
   // ------------------------------------------------------------
 
+  // Returns one account to a brand-new state: removes money, earnings, PIN, verification and activity.
+  // Keeps name, username, email, email-verified and join date. Super admin only, logged in the audit log.
+  route('/api/admin/user/reset-fresh', async (req, b) => {
+    const actor = await requireAdmin(req, 'super');
+    const uid = safeId(b.uid, 'user ID');
+    const reason = requireReason(b.reason);
+    if (b.confirm !== 'RESET') throw new Error('Type RESET to confirm.');
+
+    const u = await val(`users/${uid}`);
+    if (!u) throw new Error('User not found.');
+
+    const KEEP = ['fullName', 'fullname', 'username', 'email', 'emailVerified', 'joinedAt', 'createdAt'];
+    const patch = {};
+    const removed = [];
+    for (const k of Object.keys(u)) {
+      if (!KEEP.includes(k)) { patch[k] = null; removed.push(k); }
+    }
+    const removedValues = {};
+    for (const k of removed) removedValues[k] = u[k];
+    if (removed.length) await trashPut(actor, `users/${uid}`, 'merge', removedValues, 'Reset to new account: ' + reason);
+    await db.ref(`users/${uid}`).update(patch);
+
+    // Money and activity records that belong to this account (each one is kept in the trash first)
+    for (const node of ['walletLedger', 'walletTopups', 'pendingPayouts', 'dailyClaims', 'referrals', 'pendingReferrals']) {
+      const v = await val(`${node}/${uid}`);
+      if (v !== null && v !== undefined) {
+        await trashPut(actor, `${node}/${uid}`, 'set', v, 'Reset to new account: ' + reason);
+        await db.ref(`${node}/${uid}`).remove();
+      }
+    }
+    const wd = await db.ref('withdrawalRequests').orderByChild('uid').equalTo(uid).once('value');
+    for (const [id, w] of Object.entries(wd.val() || {})) {
+      await trashPut(actor, `withdrawalRequests/${id}`, 'set', w, 'Reset to new account: ' + reason);
+      await db.ref(`withdrawalRequests/${id}`).remove();
+    }
+
+    await writeAudit(actor, 'user_reset_fresh', 'user', uid, reason, { removedFields: removed.length }, { fresh: true });
+    return { uid, removedFields: removed.length };
+  });
+
+  // ---------- Data manager (super admin only). Every action is logged.
+  const DATA_PATH = /^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)*$/;
+  const PROTECTED_NODES = ['admins', 'adminRoles', 'adminAuditLog', 'platformSettings', 'users', 'walletLedger',
+    'walletTopups', 'withdrawalRequests', 'pendingPayouts', 'platformRevenue', 'verificationApplications', 'companies', 'campusVerifications'];
+  const checkDataPath = p => {
+    const s = String(p || '').trim().replace(/^\/+|\/+$/g, '');
+    if (!s || s.length > 300 || !DATA_PATH.test(s)) throw new Error('Enter a valid path, for example statuses or users/abc123.');
+    return s;
+  };
+  const isProtectedPath = p => PROTECTED_NODES.includes(p.split('/')[0]);
+  const countOf = v => (v && typeof v === 'object') ? Object.keys(v).length : (v === null || v === undefined ? 0 : 1);
+
+  // Keeps a copy of data before it is removed, so it can be restored. mode 'set' = put back the whole value,
+  // 'merge' = put back only the fields that were removed.
+  const trashPut = async (actor, path, mode, value, reason) => {
+    const id = db.ref('dataTrash').push().key;
+    await db.ref(`dataTrash/${id}`).set({
+      path, mode, value, deletedAt: Date.now(), deletedBy: actor.uid, deletedByName: actor.name || '',
+      reason: String(reason || ''), restoredAt: null, purgedAt: null
+    });
+    return id;
+  };
+
+  route('/api/admin/data/inspect', async (req, b) => {
+    await requireAdmin(req, 'super');
+    const p = checkDataPath(b.path);
+    const v = await val(p);
+    return {
+      path: p, exists: v !== null && v !== undefined, protected: isProtectedPath(p),
+      kind: v === null || v === undefined ? 'empty' : (typeof v === 'object' ? 'folder' : 'value'),
+      children: countOf(v), deleteWord: isProtectedPath(p) ? `DELETE PROTECTED ${p}` : `DELETE ${p}`
+    };
+  });
+
+  route('/api/admin/data/delete', async (req, b) => {
+    const actor = await requireAdmin(req, 'super');
+    const p = checkDataPath(b.path);
+    const reason = requireReason(b.reason);
+    const need = isProtectedPath(p) ? `DELETE PROTECTED ${p}` : `DELETE ${p}`;
+    if (String(b.confirm || '') !== need) throw new Error(`To confirm, type exactly: ${need}`);
+    const before = await val(p);
+    if (before === null || before === undefined) throw new Error('Nothing is stored at that path.');
+    await trashPut(actor, p, 'set', before, reason);
+    await db.ref(p).remove();
+    await writeAudit(actor, 'data_delete', 'data', p, reason, { children: countOf(before) }, null);
+    return { path: p, deleted: true };
+  });
+
+  route('/api/admin/data/create', async (req, b) => {
+    const actor = await requireAdmin(req, 'super');
+    const p = checkDataPath(b.path);
+    const reason = requireReason(b.reason);
+    let value;
+    try { value = JSON.parse(String(b.value ?? '')); }
+    catch (e) { throw new Error('The value must be valid JSON, for example {"name":"test"}, "hello" or 1.'); }
+    if (value === null) throw new Error('Use Delete to remove data. The value cannot be null.');
+    const existing = await val(p);
+    if (existing !== null && existing !== undefined && String(b.confirm || '') !== 'OVERWRITE') {
+      throw new Error('Something is already stored there. To replace it, type OVERWRITE.');
+    }
+    await db.ref(p).set(value);
+    await writeAudit(actor, existing !== null && existing !== undefined ? 'data_replace' : 'data_create', 'data', p, reason,
+      existing !== null && existing !== undefined ? { children: countOf(existing) } : null, { children: countOf(value) });
+    return { path: p, saved: true };
+  });
+
+  // ---------- Trash: list, restore, purge (super admin only, logged)
+  route('/api/admin/data/trash', async (req, b) => {
+    await requireAdmin(req, 'super');
+    const snap = await db.ref('dataTrash').orderByChild('deletedAt').limitToLast(80).once('value');
+    const items = Object.entries(snap.val() || {}).map(([id, x]) => ({
+      id, path: x.path, mode: x.mode, deletedAt: x.deletedAt || 0, deletedByName: x.deletedByName || '',
+      reason: x.reason || '', children: countOf(x.value), restoredAt: x.restoredAt || null, purgedAt: x.purgedAt || null
+    })).sort((a, b2) => b2.deletedAt - a.deletedAt);
+    return { items };
+  });
+
+  route('/api/admin/data/restore', async (req, b) => {
+    const actor = await requireAdmin(req, 'super');
+    const id = safeId(b.id, 'trash item');
+    const reason = requireReason(b.reason);
+    if (String(b.confirm || '') !== 'RESTORE') throw new Error('To confirm, type RESTORE.');
+    const item = await val(`dataTrash/${id}`);
+    if (!item) throw new Error('This item is not in the trash.');
+    if (item.restoredAt || item.purgedAt) throw new Error('This item was already restored or removed.');
+
+    if (item.mode === 'merge') {
+      await db.ref(item.path).update(item.value || {});
+    } else {
+      const current = await val(item.path);
+      if (current !== null && current !== undefined && String(b.overwrite || '') !== 'OVERWRITE') {
+        throw new Error('Something is already stored there now. To replace it with the deleted data, type OVERWRITE.');
+      }
+      await db.ref(item.path).set(item.value);
+    }
+    await db.ref(`dataTrash/${id}`).update({ restoredAt: Date.now(), restoredBy: actor.uid });
+    await writeAudit(actor, 'data_restore', 'data', item.path, reason, null, { trashId: id });
+    return { path: item.path, restored: true };
+  });
+
+  route('/api/admin/data/purge', async (req, b) => {
+    const actor = await requireAdmin(req, 'super');
+    const id = safeId(b.id, 'trash item');
+    const reason = requireReason(b.reason);
+    if (String(b.confirm || '') !== 'PURGE') throw new Error('To confirm, type PURGE.');
+    const item = await val(`dataTrash/${id}`);
+    if (!item) throw new Error('This item is not in the trash.');
+    await db.ref(`dataTrash/${id}`).remove();
+    await writeAudit(actor, 'data_purge', 'data', item.path, reason, { trashId: id }, null);
+    return { purged: true };
+  });
+
   route('/api/admin/user/verify', async (req, b) => {
     const actor = await requireAdmin(req, 'verification');
 
@@ -1139,9 +1291,9 @@ export default function registerAdminV1({
     const id = safeId(b.id, 'withdrawal ID');
     const reference = clean(b.reference, 80);
 
-    if (reference.length < 3) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9\-_\/]{4,79}$/.test(reference)) {
       throw new Error(
-        'Enter the actual bank transfer reference before confirming payment.'
+        'Enter the bank transfer reference from your receipt (at least 5 letters or numbers) before marking this as paid.'
       );
     }
 
@@ -1168,13 +1320,6 @@ export default function registerAdminV1({
       );
     }
 
-    // A previous attempt may have stopped part-way and left the payout "paying" with another reference.
-    if (initial.status === 'paying' && initial.payoutReference && initial.payoutReference !== reference && b.resumeStuck !== true) {
-      throw new Error(
-        `A previous payout attempt is recorded with reference "${initial.payoutReference}". If that transfer was made, enter that same reference. If you need to replace it, confirm "Resume stuck payout" and try again.`
-      );
-    }
-
     if (initial.status === 'paid') {
       if (initial.payoutReference !== reference) {
         throw new Error(
@@ -1188,57 +1333,57 @@ export default function registerAdminV1({
       };
     }
 
+    const now0 = Date.now();
     const claim = await wRef.transaction(current => {
-      if (!current) return;
+      // Firebase can call this with null before it has the stored value. Use the record we already read.
+      const base = current === null ? initial : current;
+      if (!base) return;
 
-      if (current.status === 'approved') {
+      if (base.status === 'approved') {
         return {
-          ...current,
+          ...base,
           status: 'paying',
           payoutStatus: 'confirming',
           payoutReference: reference,
-          payingAt: Date.now(),
+          payingAt: now0,
           payingBy: actor.uid
         };
       }
 
-      if (
-        current.status === 'paying' &&
-        actor.role === 'super_admin' &&
-        (current.payoutReference === reference || b.resumeStuck === true)
-      ) {
+      if (base.status === 'paying' && actor.role === 'super_admin' &&
+          (base.payoutReference === reference || b.resumeStuck === true)) {
         return {
-          ...current,
+          ...base,
           payoutReference: reference,
           payingBy: actor.uid,
-          payingAt: Date.now(),
-          resumedFrom: current.payoutReference || null,
-          lastPaymentRetryAt: Date.now()
+          payingAt: now0,
+          resumedFrom: base.payoutReference || null,
+          lastPaymentRetryAt: now0
         };
       }
 
-      if (
-        current.status === 'paying' &&
-        current.payoutReference === reference &&
-        (
-          current.payingBy === actor.uid ||
-          actor.role === 'super_admin'
-        )
-      ) {
-        return {
-          ...current,
-          payingBy: actor.uid,
-          lastPaymentRetryAt: Date.now()
-        };
+      if (base.status === 'paying' && base.payoutReference === reference &&
+          (base.payingBy === actor.uid || actor.role === 'super_admin')) {
+        return { ...base, payingBy: actor.uid, lastPaymentRetryAt: now0 };
       }
 
-      return;
+      return;   // not in a payable state: the transaction is refused and we explain why below
     });
 
     if (!claim.committed) {
-      throw new Error(
-        'This withdrawal cannot be processed. Check its current status and payment reference.'
-      );
+      const now1 = await val(`withdrawalRequests/${id}`);
+      if (now1 && now1.status === 'paid') {
+        throw new Error('This withdrawal is already marked as paid.');
+      }
+      if (now1 && now1.status === 'paying' && now1.payoutReference !== reference) {
+        throw new Error(
+          `A previous payout attempt is recorded with reference "${now1.payoutReference}". If that transfer was made, enter that same reference. To replace it, confirm "Resume stuck payout".`
+        );
+      }
+      if (now1 && now1.status && now1.status !== 'approved' && now1.status !== 'paying') {
+        throw new Error(`This withdrawal is "${now1.status}", so it cannot be marked as paid.`);
+      }
+      throw new Error('This withdrawal could not be updated. Refresh the page and try again.');
     }
 
     const w = claim.snapshot.val();
