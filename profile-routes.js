@@ -7,6 +7,7 @@
 
 import { presignRead, headObject, deleteObject } from "./r2-storage.js";
 
+const PUBLIC_API = "https://mudyhub-backend-1.onrender.com";
 const USERNAME = /^[a-z0-9_]{3,24}$/;
 const PHONE = /^\+?\d{10,15}$/;
 
@@ -83,9 +84,9 @@ export default function registerProfile({ app, admin, db, authenticatedUid }) {
                 const key = String(b.key);
                 if (!new RegExp("^avatars/" + uid + "/[A-Za-z0-9-]{36}\\.(jpg|png)$").test(key)) throw fail(400, "Invalid photo.");
                 if (!(await headObject(key))) throw fail(400, "The photo was not received. Please try again.");
-                await db.ref(`users/${uid}`).update({ avatarKey: key, avatarUrl: `/api/avatar/${uid}?v=${Date.now()}`, avatarUpdatedAt: Date.now() });
+                await db.ref(`users/${uid}`).update({ avatarKey: key, avatarUrl: `${PUBLIC_API}/api/avatar/${uid}?v=${Date.now()}`, avatarUpdatedAt: Date.now() });
                 if (oldKey && oldKey !== key) await deleteObject(oldKey).catch(() => {});
-                return res.json({ ok: true, avatarUrl: `/api/avatar/${uid}` });
+                return res.json({ ok: true, avatarUrl: `${PUBLIC_API}/api/avatar/${uid}` });
             }
             // Fallback while storage is not set up: the photo is kept in the record, as before.
             const dataUrl = String(b.dataUrl || "");
