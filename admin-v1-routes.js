@@ -772,6 +772,42 @@ export default function registerAdminV1({
     return { path: p, saved: true };
   });
 
+  // ---------- Browser: open any node and see its children (super admin only)
+  const ROOT_NODES = ['adminAuditLog', 'adminCreatedTasks', 'adminItemSubmissions', 'admin_logs', 'admins', 'adminRoles',
+    'aiLogs', 'aiUsage', 'blocks', 'calls', 'campaigns', 'campusFeed', 'campusVerifications', 'chatMembers', 'comments',
+    'companies', 'dailyClaims', 'dataTrash', 'followers', 'following', 'graduateJobs', 'groups', 'guides', 'jobApplicants',
+    'jobs', 'messages', 'moderatedContent', 'notifications', 'pendingPayouts', 'pendingReferrals', 'platformRevenue',
+    'platformSettings', 'postMedia', 'posts', 'presence', 'promoteRequests', 'publicProfiles', 'quizAttempts', 'referrals',
+    'showroom', 'siwesOrders', 'siwesPayments', 'siwesReports', 'slotClaims', 'slotReleases', 'statusMedia', 'statuses',
+    'submissions', 'super_admin_kyc', 'taskClaims', 'taskSubmissions', 'tcDiscoverShown', 'tcDiscoverViews', 'topupIntents',
+    'trueConnectionDeclines', 'trueConnectionDecisions', 'trueConnectionEligibility', 'trueConnectionLive',
+    'trueConnectionMatchRateLimit', 'trueConnectionMoods', 'trueConnectionProfiles', 'trueConnectionRecommendations',
+    'trueConnectionRequests', 'trueConnectionSafetyReports', 'trueConnections', 'userApplications', 'userChats',
+    'userWarnings', 'usernameIndex', 'users', 'verificationApplications', 'walletLedger', 'walletTopups', 'withdrawalRequests'];
+
+  route('/api/admin/data/browse', async (req, b) => {
+    await requireAdmin(req, 'super');
+    const p = b.path ? checkDataPath(b.path) : '';
+    if (!p) {
+      return { path: '', folder: true, total: ROOT_NODES.length, protected: false,
+        children: ROOT_NODES.map(k => ({ key: k, type: 'folder', count: null, preview: null })) };
+    }
+    const snap = await db.ref(p).limitToFirst(200).once('value');
+    const v = snap.val();
+    if (v === null || v === undefined) return { path: p, empty: true, protected: isProtectedPath(p) };
+    if (typeof v !== 'object') return { path: p, value: v, protected: isProtectedPath(p) };
+    const keys = Object.keys(v);
+    return {
+      path: p, folder: true, total: keys.length, truncated: keys.length >= 200, protected: isProtectedPath(p),
+      children: keys.map(k => {
+        const x = v[k];
+        const isFolder = x !== null && typeof x === 'object';
+        return { key: k, type: isFolder ? 'folder' : typeof x, count: isFolder ? Object.keys(x).length : null,
+          preview: isFolder ? null : String(x).slice(0, 120) };
+      })
+    };
+  });
+
   // ---------- Trash: list, restore, purge (super admin only, logged)
   route('/api/admin/data/trash', async (req, b) => {
     await requireAdmin(req, 'super');
