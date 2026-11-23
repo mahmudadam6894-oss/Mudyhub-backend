@@ -5,6 +5,8 @@
 //   POST /api/profile/update   { fullName, username, phone, country, skills, goals }
 //   POST /api/profile/avatar   { dataUrl }     (JPEG or PNG, up to about 1 MB)
 
+import { presignRead, headObject, deleteObject } from "./r2-storage.js";
+
 const USERNAME = /^[a-z0-9_]{3,24}$/;
 const PHONE = /^\+?\d{10,15}$/;
 
@@ -56,15 +58,41 @@ export default function registerProfile({ app, admin, db, authenticatedUid }) {
         } catch (e) { return reply(res, e); }
     });
 
+    // Stable link for a member's photo. It redirects to a fresh, short-lived link to the file in R2.
+    // Public on purpose: profile photos are visible across the app.
+    app.get("/api/avatar/:uid", async (req, res) => {
+        try {
+            const uid = String(req.params.uid || "");
+            if (!/^[A-Za-z0-9_-]{6,128}$/.test(uid)) return res.status(404).end();
+            const key = await val(`users/${uid}/avatarKey`);
+            if (!key) return res.status(404).end();
+            const url = await presignRead(key, 300);
+            res.setHeader("Cache-Control", "private, max-age=120");
+            return res.redirect(302, url);
+        } catch (e) { console.error("[avatar]", e.message); return res.status(404).end(); }
+    });
+
     app.post("/api/profile/avatar", async (req, res) => {
         try {
             const uid = await authenticatedUid(req);
             await activeUser(uid);
-            const dataUrl = String((req.body || {}).dataUrl || "");
+            const b = req.body || {};
+            const oldKey = await val(`users/${uid}/avatarKey`);
+            if (b.key) {
+                // New way: the photo is already in R2 (uploaded and confirmed by /api/files/*).
+                const key = String(b.key);
+                if (!new RegExp("^avatars/" + uid + "/[A-Za-z0-9-]{36}\\.(jpg|png)$").test(key)) throw fail(400, "Invalid photo.");
+                if (!(await headObject(key))) throw fail(400, "The photo was not received. Please try again.");
+                await db.ref(`users/${uid}`).update({ avatarKey: key, avatarUrl: `/api/avatar/${uid}?v=${Date.now()}`, avatarUpdatedAt: Date.now() });
+                if (oldKey && oldKey !== key) await deleteObject(oldKey).catch(() => {});
+                return res.json({ ok: true, avatarUrl: `/api/avatar/${uid}` });
+            }
+            // Fallback while storage is not set up: the photo is kept in the record, as before.
+            const dataUrl = String(b.dataUrl || "");
             if (!/^data:image\/(jpeg|png);base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) throw fail(400, "Choose a JPEG or PNG photo.");
             if (dataUrl.length > 1400000) throw fail(400, "That photo is too large. Choose a smaller one.");
             await db.ref(`users/${uid}/avatarUrl`).set(dataUrl);
-            return res.json({ ok: true });
+            return res.json({ ok: true, avatarUrl: dataUrl });
         } catch (e) { return reply(res, e); }
     });
 }
