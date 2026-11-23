@@ -12,6 +12,7 @@ import registerBusiness from './business-routes.js';
 import registerJobs from './jobs-routes.js';
 import registerVerification from './verification-routes.js';
 import registerStorage from './storage-routes.js';
+import registerProfile from './profile-routes.js';
 import {
   Document, Packer, Paragraph, TextRun, AlignmentType, ImageRun,
   PageBreak, Footer, PageNumber, HeadingLevel, NumberFormat, TableOfContents, TabStopType, LeaderType
@@ -1855,6 +1856,7 @@ registerBusiness({ app, admin, db, authenticatedUid, requireAdmin, writeAudit })
 registerJobs({ app, admin, db, authenticatedUid });
 registerVerification({ app, admin, db, authenticatedUid, requireAdmin, writeAudit });
 registerStorage({ app, admin, db, authenticatedUid, requireAdmin });
+registerProfile({ app, admin, db, authenticatedUid });
 app.get("/api/payment-config", async (req, res) => {
   const keys = paystackKeys();
   if (!keys.publicKey) return res.status(503).json({ error: `Paystack ${keys.mode} public key is not configured (it must start with pk_${keys.mode}_).` });
