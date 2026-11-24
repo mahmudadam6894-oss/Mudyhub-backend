@@ -21,6 +21,19 @@ export default function registerProfile({ app, admin, db, authenticatedUid }) {
     };
     const val = async path => (await db.ref(path).once("value")).val();
 
+    // Keeps the public copy of a member's name, username and photo up to date. Written by the server only.
+    async function syncPublicProfile(uid) {
+        const u = (await val(`users/${uid}`)) || {};
+        await db.ref(`publicProfiles/${uid}`).update({
+            uid,
+            username: String(u.username || ""),
+            fullName: String(u.fullName || u.fullname || ""),
+            fullname: String(u.fullName || u.fullname || ""),
+            avatarUrl: String(u.avatarUrl || ""),
+            updatedAt: Date.now()
+        });
+    }
+
     async function activeUser(uid) {
         const authUser = await admin.auth().getUser(uid);
         const u = (await val(`users/${uid}`)) || {};
@@ -55,6 +68,7 @@ export default function registerProfile({ app, admin, db, authenticatedUid }) {
 
             const updated = { fullName, fullname: fullName, username, phone, country, skills, goals };
             await db.ref(`users/${uid}`).update(updated);
+            await syncPublicProfile(uid).catch(e => console.warn("[profile] public copy:", e.message));
             return res.json({ ok: true, profile: updated });
         } catch (e) { return reply(res, e); }
     });
@@ -85,6 +99,7 @@ export default function registerProfile({ app, admin, db, authenticatedUid }) {
                 if (!new RegExp("^avatars/" + uid + "/[A-Za-z0-9-]{36}\\.(jpg|png)$").test(key)) throw fail(400, "Invalid photo.");
                 if (!(await headObject(key))) throw fail(400, "The photo was not received. Please try again.");
                 await db.ref(`users/${uid}`).update({ avatarKey: key, avatarUrl: `${PUBLIC_API}/api/avatar/${uid}?v=${Date.now()}`, avatarUpdatedAt: Date.now() });
+                await syncPublicProfile(uid).catch(e => console.warn("[profile] public copy:", e.message));
                 if (oldKey && oldKey !== key) await deleteObject(oldKey).catch(() => {});
                 return res.json({ ok: true, avatarUrl: `${PUBLIC_API}/api/avatar/${uid}` });
             }
@@ -93,6 +108,7 @@ export default function registerProfile({ app, admin, db, authenticatedUid }) {
             if (!/^data:image\/(jpeg|png);base64,[A-Za-z0-9+/=]+$/.test(dataUrl)) throw fail(400, "Choose a JPEG or PNG photo.");
             if (dataUrl.length > 1400000) throw fail(400, "That photo is too large. Choose a smaller one.");
             await db.ref(`users/${uid}/avatarUrl`).set(dataUrl);
+            await syncPublicProfile(uid).catch(e => console.warn("[profile] public copy:", e.message));
             return res.json({ ok: true, avatarUrl: dataUrl });
         } catch (e) { return reply(res, e); }
     });
