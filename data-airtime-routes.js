@@ -70,6 +70,12 @@ function safeError(payload, fallback) {
   return String(payload?.message || payload?.error || payload?.data?.message || fallback).slice(0, 240);
 }
 
+// Provider replies are saved as short text, never as raw objects: Firebase rejects keys that contain
+// characters such as "." or "$", and a rejected write after a delivered purchase must never happen.
+function snapshotPayload(payload) {
+  try { return JSON.stringify(payload).slice(0, 2000); } catch (_) { return ''; }
+}
+
 // Only fields that are safe to show the customer. Provider details stay on the server.
 function publicOrder(order) {
   return {
@@ -220,6 +226,11 @@ function registerPurchaseRoute({ app, db, authenticatedUid, kind }) {
         const amount = Number(body.amount);
         if (!Number.isSafeInteger(amount) || amount < 50 || amount > 50000) return res.status(400).json({ ok: false, error: 'Airtime amount must be between ₦50 and ₦50,000.' });
         customerAmount = amount;
+        // Optional profit tracking: set AIRTIME_DISCOUNT_PERCENT in Render to MELE's airtime discount (for example 2).
+        const discount = Number(process.env.AIRTIME_DISCOUNT_PERCENT);
+        if (process.env.AIRTIME_DISCOUNT_PERCENT && Number.isFinite(discount) && discount >= 0 && discount < 50) {
+          providerCost = Math.round(amount * (1 - discount / 100) * 100) / 100;
+        }
         description = `${network} airtime ₦${amount}`;
         // Verify this body format against MELE's airtime documentation before going live.
         providerBody = { network, phone, amount, reference: providerRequestId };
@@ -285,7 +296,7 @@ function registerPurchaseRoute({ app, db, authenticatedUid, kind }) {
       const providerRef = providerResult.payload?.data?.reference || providerResult.payload?.reference || order.providerReference;
 
       if (providerStatus === 'success' && providerResult.response.ok) {
-        await orderRef.update({ status: 'completed', providerReference: providerRef, providerResponse: providerResult.payload, completedAt: now(), updatedAt: now() });
+        await orderRef.update({ status: 'completed', providerReference: providerRef, providerResponse: snapshotPayload(providerResult.payload), completedAt: now(), updatedAt: now() });
         await Promise.allSettled([
           db.ref(`users/${uid}/transactions/${id}`).update({ status: 'completed', providerReference: providerRef, completedAt: now() }),
           db.ref(`walletLedger/${uid}/${id}`).update({ status: 'completed', providerReference: providerRef }),
@@ -298,13 +309,13 @@ function registerPurchaseRoute({ app, db, authenticatedUid, kind }) {
       const clearlyFailed = httpStatus < 500 && (providerStatus === 'failed' || (httpStatus >= 400 && httpStatus !== 408));
       if (clearlyFailed) {
         const message = safeError(providerResult.payload, 'Provider rejected the purchase.');
-        await orderRef.update({ status: 'failed', providerReference: providerRef, providerMessage: message, updatedAt: now() });
+        await orderRef.update({ status: 'failed', providerReference: providerRef, providerMessage: message, providerHttpStatus: httpStatus, providerResponse: snapshotPayload(providerResult.payload), updatedAt: now() });
         const refunded = await refundOnce(db, uid, orderRef, message);
         await idempotencyRef.update({ state: refunded ? 'refunded' : 'failed' }).catch(() => {});
         return res.status(200).json({ ok: true, orderId: id, status: refunded ? 'refunded' : 'pending', message: refunded ? 'The provider could not complete this purchase. Your wallet has been refunded.' : 'The purchase could not be completed. Your refund is being processed.' });
       }
 
-      await orderRef.update({ status: 'pending', providerReference: providerRef, providerMessage: safeError(providerResult.payload, 'Provider has not confirmed the transaction.'), providerHttpStatus: httpStatus, updatedAt: now() });
+      await orderRef.update({ status: 'pending', providerReference: providerRef, providerMessage: safeError(providerResult.payload, 'Provider has not confirmed the transaction.'), providerHttpStatus: httpStatus, providerResponse: snapshotPayload(providerResult.payload), updatedAt: now() });
       await Promise.allSettled([
         db.ref(`users/${uid}/transactions/${id}`).update({ status: 'pending', providerReference: providerRef }),
         idempotencyRef.update({ state: 'pending' })
@@ -413,7 +424,7 @@ export default function registerDataAirtime({ app, db, authenticatedUid, require
             if (result.response.ok) {
               const status = normalizeStatus(result.payload);
               if (status === 'success') {
-                await orderRef.update({ status: 'completed', providerResponse: result.payload, completedAt: now(), updatedAt: now() });
+                await orderRef.update({ status: 'completed', providerResponse: snapshotPayload(result.payload), completedAt: now(), updatedAt: now() });
                 await Promise.allSettled([
                   db.ref(`users/${uid}/transactions/${order.id}`).update({ status: 'completed', completedAt: now() }),
                   db.ref(`walletLedger/${uid}/${order.id}`).update({ status: 'completed' }),
@@ -422,7 +433,7 @@ export default function registerDataAirtime({ app, db, authenticatedUid, require
                 order.status = 'completed';
               } else if (status === 'failed') {
                 const message = safeError(result.payload, 'Provider confirmed the transaction failed.');
-                await orderRef.update({ status: 'failed', updatedAt: now(), providerResponse: result.payload });
+                await orderRef.update({ status: 'failed', updatedAt: now(), providerResponse: snapshotPayload(result.payload) });
                 const refunded = await refundOnce(db, uid, orderRef, message);
                 await db.ref(`dataAirtimeIdempotency/${uid}/${order.idempotencyKey}`).update({ state: refunded ? 'refunded' : 'failed' }).catch(() => {});
                 order.status = refunded ? 'refunded' : 'pending';
