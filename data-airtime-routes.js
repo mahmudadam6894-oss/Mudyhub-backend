@@ -212,8 +212,18 @@ function registerPurchaseRoute({ app, db, authenticatedUid, kind }) {
         const planId = String(body.planId || '').trim();
         if (!/^\d{1,10}$/.test(planId)) return res.status(400).json({ ok: false, error: 'Select a valid data plan.' });
         const plan = (await db.ref(`serviceCatalog/dataPlans/${planId}`).once('value')).val();
-        if (!plan || plan.enabled !== true || String(plan.network || '').toUpperCase() !== network) return res.status(400).json({ ok: false, error: 'This data plan is unavailable. Refresh the plans and try again.' });
         if (!isNaira(plan.sellingPrice) || !/^\d{1,10}$/.test(String(plan.providerPlanId || ''))) return res.status(503).json({ ok: false, error: 'This plan is not fully configured yet. Please contact support.' });
+        if (
+  !plan ||
+  plan.enabled !== true ||
+  plan.verified !== true ||
+  String(plan.network || '').toUpperCase() !== network
+) {
+  return res.status(400).json({
+    ok: false,
+    error: 'This data plan is unavailable. Refresh the plans and try again.'
+  });
+                                                               }
         const cost = Number(plan.providerCost);
         // Safety: never sell a plan below its own cost price.
         if (Number.isFinite(cost) && cost > 0 && Number(plan.sellingPrice) < cost) return res.status(503).json({ ok: false, error: 'This plan is temporarily unavailable. Please contact support.' });
@@ -355,8 +365,13 @@ export default function registerDataAirtime({ app, db, authenticatedUid, require
       const snap = await db.ref('serviceCatalog/dataPlans').once('value');
       const raw = snap.val() || {};
       const plans = Object.entries(raw)
-        .filter(([, p]) => p && p.enabled === true && (!network || String(p.network || '').toUpperCase() === network))
         .map(([id, p]) => ({ id, network: String(p.network || '').toUpperCase(), name: p.name, validity: p.validity || null, type: p.type || null, price: Number(p.sellingPrice), cost: Number(p.providerCost), providerPlanId: String(p.providerPlanId || '') }))
+        .filter(([, p]) =>
+  p &&
+  p.enabled === true &&
+  p.verified === true &&
+  (!network || String(p.network || '').toUpperCase() === network)
+)
         .filter(p => ALLOWED_NETWORKS.has(p.network) && Number.isSafeInteger(p.price) && p.price > 0 && /^\d{1,10}$/.test(p.providerPlanId))
         .filter(p => !(Number.isFinite(p.cost) && p.cost > 0 && p.price < p.cost))
         .map(p => ({ id: p.id, network: p.network, name: p.name, validity: p.validity, type: p.type, price: p.price, currency: 'NGN' }));
