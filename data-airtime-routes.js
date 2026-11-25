@@ -212,7 +212,7 @@ function registerPurchaseRoute({ app, db, authenticatedUid, kind }) {
         const planId = String(body.planId || '').trim();
         if (!/^\d{1,10}$/.test(planId)) return res.status(400).json({ ok: false, error: 'Select a valid data plan.' });
         const plan = (await db.ref(`serviceCatalog/dataPlans/${planId}`).once('value')).val();
-        if (!isNaira(plan.sellingPrice) || !/^\d{1,10}$/.test(String(plan.providerPlanId || ''))) return res.status(503).json({ ok: false, error: 'This plan is not fully configured yet. Please contact support.' });
+        if (!plan || !isNaira(plan.sellingPrice) || !/^\d{1,10}$/.test(String(plan.providerPlanId || ''))) return res.status(503).json({ ok: false, error: 'This plan is not fully configured yet. Please contact support.' });
         if (
   !plan ||
   plan.enabled !== true ||
@@ -357,30 +357,77 @@ function registerPurchaseRoute({ app, db, authenticatedUid, kind }) {
 }
 
 export default function registerDataAirtime({ app, db, authenticatedUid, requireAdmin }) {
-  // Customer-facing plan list. Only plans loaded AND enabled in MudyHub's own catalogue are shown.
+  
+  // Customer-facing plan list.
+  // Only verified and enabled plans in MudyHub's own catalogue are shown.
   app.get('/api/data-airtime/plans', async (req, res) => {
     try {
       await authenticatedUid(req);
-      const network = String(req.query.network || '').trim().toUpperCase();
+
+      const network = String(req.query.network || '')
+        .trim()
+        .toUpperCase();
+
+      if (network && !ALLOWED_NETWORKS.has(network)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Select a supported network.'
+        });
+      }
+
       const snap = await db.ref('serviceCatalog/dataPlans').once('value');
       const raw = snap.val() || {};
+
       const plans = Object.entries(raw)
-        .map(([id, p]) => ({ id, network: String(p.network || '').toUpperCase(), name: p.name, validity: p.validity || null, type: p.type || null, price: Number(p.sellingPrice), cost: Number(p.providerCost), providerPlanId: String(p.providerPlanId || '') }))
-        .filter(([, p]) =>
-  p &&
-  p.enabled === true &&
-  p.verified === true &&
-  (!network || String(p.network || '').toUpperCase() === network)
-)
-        .filter(p => ALLOWED_NETWORKS.has(p.network) && Number.isSafeInteger(p.price) && p.price > 0 && /^\d{1,10}$/.test(p.providerPlanId))
-        .filter(p => !(Number.isFinite(p.cost) && p.cost > 0 && p.price < p.cost))
-        .map(p => ({ id: p.id, network: p.network, name: p.name, validity: p.validity, type: p.type, price: p.price, currency: 'NGN' }));
+
+        .map(([id, p]) => ({
+          id,
+          network: String(p?.network || '').toUpperCase(),
+          name: p?.name || 'Data bundle',
+          validity: p?.validity || null,
+          type: p?.type || null,
+          price: Number(p?.sellingPrice),
+          cost: Number(p?.providerCost),
+          providerPlanId: String(p?.providerPlanId || ''),
+          enabled: p?.enabled === true,
+          verified: p?.verified === true
+        }))
+
+        .filter(p =>
+          p.enabled &&
+          p.verified &&
+          ALLOWED_NETWORKS.has(p.network) &&
+          (!network || p.network === network) &&
+          Number.isSafeInteger(p.price) &&
+          p.price > 0 &&
+          /^\d{1,10}$/.test(p.providerPlanId) &&
+          !(Number.isFinite(p.cost) && p.cost > 0 && p.price < p.cost)
+        )
+
+        .map(p => ({
+          id: p.id,
+          network: p.network,
+          name: p.name,
+          validity: p.validity,
+          type: p.type,
+          price: p.price,
+          currency: 'NGN'
+        }));
+
       return res.json({ ok: true, plans });
+
     } catch (error) {
-      return res.status(error.message === 'Unauthorized' ? 401 : 500).json({ ok: false, error: error.message || 'Could not load data plans.' });
+      console.error('[DATA-AIRTIME] Plans error:', error);
+
+      return res.status(
+        error.message === 'Unauthorized' ? 401 : 500
+      ).json({
+        ok: false,
+        error: error.message || 'Could not load data plans.'
+      });
     }
   });
-
+            
   // FIX: the provider wallet balance is business information, so it is now Super Admin only.
   app.get('/api/data-airtime/provider/balance', async (req, res) => {
     try {
