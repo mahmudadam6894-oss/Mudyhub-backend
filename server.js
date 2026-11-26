@@ -1456,7 +1456,130 @@ async function authenticatedUid(req) {
     throw new Error("Unauthorized");
   }
 }
+// -----------------------------------------------------
+// FIREBASE EMAIL VERIFICATION — delivered through Brevo
+// Firebase creates and validates the action link; Brevo only delivers it.
+// -----------------------------------------------------
+const emailVerificationLastSent = new Map();
+const EMAIL_VERIFICATION_COOLDOWN_MS = 60_000;
+const EMAIL_VERIFICATION_CONTINUE_URL =
+  process.env.EMAIL_VERIFICATION_CONTINUE_URL ||
+  "https://mudyhub.pages.dev/signup.html?emailVerified=1";
 
+function escapeEmailHtml(value) {
+  return String(value || "").replace(/[&<>"']/g, char => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  })[char]);
+}
+
+app.post("/api/auth/send-email-verification", async (req, res) => {
+  let uid;
+  try {
+    uid = await authenticatedUid(req);
+  } catch (_) {
+    return res.status(401).json({ ok: false, error: "Please sign in again." });
+  }
+
+  try {
+    const user = await admin.auth().getUser(uid);
+    if (user.disabled) {
+      return res.status(403).json({ ok: false, error: "This account is not available." });
+    }
+    if (!user.email) {
+      return res.status(400).json({ ok: false, error: "Your account has no email address." });
+    }
+    if (user.emailVerified) {
+      return res.json({ ok: true, alreadyVerified: true });
+    }
+    if (!process.env.BREVO_API_KEY) {
+      console.error("[Email verification] BREVO_API_KEY is not configured.");
+      return res.status(503).json({ ok: false, error: "Email delivery is temporarily unavailable." });
+    }
+
+    const now = Date.now();
+    const lastSent = emailVerificationLastSent.get(uid) || 0;
+    const remaining = EMAIL_VERIFICATION_COOLDOWN_MS - (now - lastSent);
+    if (remaining > 0) {
+      return res.status(429).json({
+        ok: false,
+        error: "Please wait before requesting another verification email.",
+        retryAfterSeconds: Math.ceil(remaining / 1000)
+      });
+    }
+
+    // Record the attempt before contacting Brevo to prevent rapid duplicate sends.
+    emailVerificationLastSent.set(uid, now);
+
+    const actionLink = await admin.auth().generateEmailVerificationLink(
+      user.email,
+      {
+        url: EMAIL_VERIFICATION_CONTINUE_URL,
+        handleCodeInApp: false
+      }
+    );
+
+    const recipientName = escapeEmailHtml(user.displayName || "MudyHub member");
+    const recipientEmail = escapeEmailHtml(user.email);
+    const safeActionLink = escapeEmailHtml(actionLink);
+    const senderEmail = process.env.BREVO_SENDER_EMAIL || "mahmudadam6894@gmail.com";
+    const senderName = process.env.BREVO_SENDER_NAME || "MudyHub";
+
+    const htmlContent = `
+      <!doctype html>
+      <html lang="en">
+      <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+      <body style="margin:0;padding:24px;background:#f5f5f5;font-family:Arial,sans-serif;color:#171717">
+        <div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:16px;padding:32px 24px">
+          <div style="font-size:26px;font-weight:800;color:#111111">Mudy<span style="color:#d6a900">Hub</span></div>
+          <h1 style="font-size:23px;margin:28px 0 12px">Verify your email address</h1>
+          <p style="line-height:1.6">Hello ${recipientName},</p>
+          <p style="line-height:1.6">Please confirm that <strong>${recipientEmail}</strong> belongs to you by clicking the button below.</p>
+          <p style="margin:28px 0">
+            <a href="${safeActionLink}" style="display:inline-block;background:#ffcc00;color:#111111;text-decoration:none;font-weight:700;padding:14px 22px;border-radius:10px">Verify Email Address</a>
+          </p>
+          <p style="font-size:13px;line-height:1.6;color:#666">If the button does not work, copy and paste this link into your browser:<br><a href="${safeActionLink}" style="color:#8a6b00;word-break:break-all">${safeActionLink}</a></p>
+          <p style="font-size:13px;line-height:1.6;color:#777">If you did not create a MudyHub account, you can ignore this email.</p>
+          <hr style="border:0;border-top:1px solid #eeeeee;margin:28px 0">
+          <p style="font-size:12px;color:#999">MudyHub · Learn. Work. Earn. Grow.</p>
+        </div>
+      </body>
+      </html>`;
+
+    const textContent =
+      `Hello ${user.displayName || "MudyHub member"},\n\n` +
+      `Please verify your MudyHub email address (${user.email}) using this link:\n${actionLink}\n\n` +
+      `If you did not create a MudyHub account, ignore this email.`;
+
+    const brevoResponse = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        "accept": "application/json",
+        "api-key": process.env.BREVO_API_KEY,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        sender: { name: senderName, email: senderEmail },
+        to: [{ email: user.email, name: user.displayName || "MudyHub member" }],
+        subject: "Verify your MudyHub email address",
+        htmlContent,
+        textContent
+      })
+    });
+
+    if (!brevoResponse.ok) {
+      const providerMessage = await brevoResponse.text().catch(() => "");
+      console.error("[Email verification] Brevo rejected the message:", brevoResponse.status, providerMessage.slice(0, 300));
+      emailVerificationLastSent.delete(uid);
+      return res.status(502).json({ ok: false, error: "We could not send your verification email. Please try again." });
+    }
+
+    return res.json({ ok: true, message: "Verification email sent." });
+  } catch (error) {
+    emailVerificationLastSent.delete(uid);
+    console.error("[Email verification] Request failed:", error.message);
+    return res.status(500).json({ ok: false, error: "We could not send your verification email. Please try again." });
+  }
+}); and 
 
 // =====================================================================
 // ADMIN AUTHORIZATION + AUDIT — all privileged actions are server-checked
