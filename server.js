@@ -1981,7 +1981,7 @@ registerJobs({ app, admin, db, authenticatedUid });
 registerVerification({ app, admin, db, authenticatedUid, requireAdmin, writeAudit });
 registerStorage({ app, admin, db, authenticatedUid, requireAdmin });
 registerProfile({ app, admin, db, authenticatedUid });
-registerDataAirtime({ app, db, authenticatedUid });
+registerDataAirtime({ app, db, authenticatedUid, requireAdmin });
 app.get("/api/payment-config", async (req, res) => {
   const keys = paystackKeys();
   if (!keys.publicKey) return res.status(503).json({ error: `Paystack ${keys.mode} public key is not configured (it must start with pk_${keys.mode}_).` });
