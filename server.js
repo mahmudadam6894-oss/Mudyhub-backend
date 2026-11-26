@@ -1579,7 +1579,7 @@ app.post("/api/auth/send-email-verification", async (req, res) => {
     console.error("[Email verification] Request failed:", error.message);
     return res.status(500).json({ ok: false, error: "We could not send your verification email. Please try again." });
   }
-}); and 
+});
 
 // =====================================================================
 // ADMIN AUTHORIZATION + AUDIT — all privileged actions are server-checked
