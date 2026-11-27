@@ -507,12 +507,14 @@ export function registerAirtimeCash({
         }
 
         if (typeof writeAudit === 'function') {
-          await writeAudit(actor, 'airtime_cash_request_rejected', {
-            uid,
-            requestId: id,
-            reason: rejectReason || 'Request could not be verified.'
-          });
-        }
+  await writeAudit(
+    actor,
+    'airtime_cash_request_rejected',
+    'airtime_cash_request',
+    `${uid}/${id}`,
+    rejectReason || 'Request could not be verified.'
+  );
+            }
 
         return res.json({
           ok: true,
@@ -605,26 +607,28 @@ export function registerAirtimeCash({
       });
 
       // Record wallet history.
-      await db.ref(`walletLedger/${uid}/${id}`).set({
-        type: 'credit',
-        category: 'airtime_to_cash',
-        amount: payout,
-        description: 'Airtime to Cash payout',
-        reference: id,
-        createdAt: creditRecord.creditedAt || now()
-      });
+await db.ref(`walletLedger/${uid}/${id}`).set({
+  type: 'airtime_to_cash',
+  direction: 'credit',
+  category: 'airtime_to_cash',
+  amount: payout,
+  description: 'Airtime to Cash payout',
+  reference: id,
+  status: 'completed',
+  createdAt: creditRecord.creditedAt || now()
+});
 
       // Keep the user's transaction history in sync.
-      await db.ref(`users/${uid}/transactions/${id}`).set({
-        type: 'credit',
-        category: 'airtime_to_cash',
-        amount: payout,
-        description: 'Airtime to Cash payout',
-        reference: id,
-        status: 'completed',
-        createdAt: creditRecord.creditedAt || now()
-      });
-
+await db.ref(`users/${uid}/transactions/${id}`).set({
+  type: 'airtime_to_cash',
+  direction: 'credit',
+  category: 'airtime_to_cash',
+  amount: payout,
+  description: 'Airtime to Cash payout',
+  reference: id,
+  status: 'completed',
+  createdAt: creditRecord.creditedAt || now()
+});
       await requestRef.update({
         status: 'approved',
         credited: true,
@@ -635,13 +639,16 @@ export function registerAirtimeCash({
       });
 
       if (typeof writeAudit === 'function') {
-        await writeAudit(actor, 'airtime_cash_request_approved', {
-          uid,
-          requestId: id,
-          amount: payout,
-          alreadyCredited
-        });
-      }
+  await writeAudit(
+    actor,
+    'airtime_cash_request_approved',
+    'airtime_cash_request',
+    `${uid}/${id}`,
+    'Airtime verified and payout approved',
+    null,
+    { amount: payout, alreadyCredited }
+  );
+        }
 
       return res.json({
         ok: true,
