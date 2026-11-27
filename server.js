@@ -1679,6 +1679,8 @@ app.post("/api/auth/request-password-reset", async (req, res) => {
 // -----------------------------------------------------
 // Phone verification stays built in but is optional until REQUIRE_PHONE_VERIFICATION=true is set on Render.
 const REQUIRE_PHONE_VERIFICATION = String(process.env.REQUIRE_PHONE_VERIFICATION || "").toLowerCase() === "true";
+// Same for email: optional until REQUIRE_EMAIL_VERIFICATION=true is set on Render.
+const REQUIRE_EMAIL_VERIFICATION = String(process.env.REQUIRE_EMAIL_VERIFICATION || "").toLowerCase() === "true";
 app.post("/api/auth/complete-registration", async (req, res) => {
   let uid;
   try {
@@ -1697,7 +1699,7 @@ app.post("/api/auth/complete-registration", async (req, res) => {
     if (authUser.disabled || !profile || !authUser.email || String(profile.email || "").trim().toLowerCase() !== authUser.email.toLowerCase()) {
       return res.status(403).json({ ok: false, error: "Registration cannot be completed." });
     }
-    if (!authUser.emailVerified) {
+    if (REQUIRE_EMAIL_VERIFICATION && !authUser.emailVerified) {
       return res.status(409).json({ ok: false, code: "EMAIL_NOT_VERIFIED", error: "Verify your email address first." });
     }
     if (REQUIRE_PHONE_VERIFICATION && !authUser.phoneNumber) {
@@ -1729,8 +1731,8 @@ app.post("/api/auth/complete-registration", async (req, res) => {
 
     const now = admin.database.ServerValue.TIMESTAMP;
     await db.ref(`users/${uid}`).update({
-      emailVerified: true,
-      emailVerifiedAt: now,
+      emailVerified: !!authUser.emailVerified,
+      ...(authUser.emailVerified ? { emailVerifiedAt: now } : {}),
       phoneVerified: phoneIsVerified,
       ...(phoneIsVerified ? { phoneVerifiedAt: now } : {}),
       registrationStatus: "active",
