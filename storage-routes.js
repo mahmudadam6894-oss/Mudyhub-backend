@@ -17,13 +17,13 @@ const RULES = {
     "verification-doc":    { prefix: "verification", types: ["image/jpeg", "image/png", "application/pdf"], max: 5 * MB,   adminPerm: "verification" },
     "verification-selfie": { prefix: "verification", types: ["image/jpeg", "image/png"],                    max: 5 * MB,   adminPerm: "verification" },
     "tc-photo":            { prefix: "tc-photos",    types: ["image/jpeg", "image/png"],                    max: 600 * 1024 },
-    "status-image":        { prefix: "status",       types: ["image/jpeg"],                                 max: 6 * MB, public: true },
-    "status-video":        { prefix: "status",       types: ["video/mp4", "video/webm", "video/quicktime"], max: 4 * MB, public: true },
-    "status-audio":        { prefix: "status",       types: ["audio/webm", "audio/mp4", "audio/ogg"],       max: 2.5 * MB, public: true },
-    "post-media":          { prefix: "posts",        types: ["image/jpeg", "video/mp4", "video/webm", "video/quicktime"], max: 7 * MB, public: true },
+    "status-image":        { prefix: "status",       types: ["image/jpeg"],                                 max: 10 * MB, public: true },
+    "status-video":        { prefix: "status",       types: ["video/mp4", "video/webm", "video/quicktime"], max: 10 * MB, public: true },
+    "status-audio":        { prefix: "status",       types: ["audio/webm", "audio/mp4", "audio/ogg"],       max: 10 * MB, public: true },
+    "post-media":          { prefix: "posts",        types: ["image/jpeg", "video/mp4", "video/webm", "video/quicktime"], max: 10 * MB, public: true },
     "avatar":              { prefix: "avatars",      types: ["image/jpeg", "image/png"],                    max: 2 * MB,   public: true },
     "campus-slip":         { prefix: "campus",       types: ["image/jpeg", "image/png", "application/pdf"], max: 5 * MB,   adminPerm: "campus" },
-    "earning-proof":       { prefix: "proofs",       types: ["image/jpeg", "image/png", "image/webp"],      max: 5 * MB,   adminPerm: "tasks" },
+    "earning-proof":       { prefix: "proofs",       types: ["image/jpeg", "image/png", "image/webp"],      max: 10 * MB,   adminPerm: "tasks" },
     "business-doc":        { prefix: "business",     types: ["image/jpeg", "image/png", "application/pdf"], max: 5 * MB,   adminPerm: "business" },
     "siwes-report":        { prefix: "siwes",        types: ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"], max: 10 * MB }
 };
@@ -115,6 +115,38 @@ export default function registerStorage({ app, admin, db, authenticatedUid, requ
             const url = await presignRead(key, 300);
             return res.json({ ok: true, url, expiresIn: 300 });
         } catch (e) { return reply(res, e); }
+    });
+
+    // ---------- 5. Reels list: the server finds the videos, so the app downloads only what it needs ----------
+    app.post("/api/reels", async (req, res) => {
+        try {
+            const uid = await authenticatedUid(req);
+            await activeUser(uid);
+            const snap = await db.ref("posts").orderByChild("createdAt").limitToLast(80).once("value");
+            const rows = Object.entries(snap.val() || {}).map(([id, p]) => {
+                if (!p || !p.mediaKeys) return null;
+                const list = Array.isArray(p.mediaKeys) ? p.mediaKeys : Object.values(p.mediaKeys);
+                const video = list.find(k => k && k.type === "video" && typeof k.key === "string");
+                if (!video) return null;
+                return {
+                    id, userId: String(p.userId || ""), content: String(p.content || "").slice(0, 300),
+                    createdAt: Number(p.createdAt || 0), videoKey: video.key,
+                    likeCount: p.likes ? Object.keys(p.likes).length : 0,
+                    liked: !!(p.likes && p.likes[uid])
+                };
+            }).filter(Boolean).sort((a, b) => b.createdAt - a.createdAt).slice(0, 40);
+
+            // Each author's public username, read on the server.
+            const names = {};
+            await Promise.all([...new Set(rows.map(r => r.userId).filter(Boolean))].map(async id => {
+                const u = (await db.ref(`users/${id}/username`).once("value")).val();
+                names[id] = typeof u === "string" ? u : "";
+            }));
+            return res.json({ ok: true, reels: rows.map(r => ({ ...r, username: names[r.userId] || "" })) });
+        } catch (e) {
+            console.error("[reels]", e.message);
+            return res.status(e.status || 500).json({ error: e.status ? e.message : "Reels could not load. Please try again." });
+        }
     });
 
     // ---------- 4. delete (owner only) ----------
