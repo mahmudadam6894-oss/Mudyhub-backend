@@ -357,17 +357,23 @@ export function registerAirtimeCash({
         updatedBy: actor.uid || actor.id || 'super_admin'
       };
 
-      await configRef.set(config);
-
-      if (typeof writeAudit === 'function') {
-        await writeAudit(actor, 'airtime_cash_config_updated', {
-          enabled,
-          minAmount,
-          maxAmount,
-          payoutPercent,
-          enabledNetworks: enabledNetworks.map(n => n.network)
-        });
-      }
+            if (typeof writeAudit === 'function') {
+        await writeAudit(
+          actor,
+          'airtime_cash_config_updated',
+          'airtime_cash_config',
+          'settings',
+          'Airtime to Cash settings updated',
+          null,
+          {
+            enabled,
+            minAmount,
+            maxAmount,
+            payoutPercent,
+            enabledNetworks: enabledNetworks.map(n => n.network)
+          }
+        );
+  }
 
       return res.json({
         ok: true,
@@ -464,7 +470,13 @@ export function registerAirtimeCash({
         }
 
         if (typeof writeAudit === 'function') {
-          await writeAudit(actor, 'airtime_cash_marked_processing', { uid, requestId: id });
+  await writeAudit(
+    actor,
+    'airtime_cash_marked_processing',
+    'airtime_cash_request',
+    `${uid}/${id}`,
+    'Request marked as processing'
+  );
         }
 
         return res.json({
