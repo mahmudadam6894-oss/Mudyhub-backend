@@ -75,22 +75,7 @@ export function registerAirtimeCash({
 
   const configRef = db.ref('serviceConfig/airtimeCash');
 
-  // --------------------------------------------------------------------------
-  // CUSTOMER: wallet balance. Same source used by the rest of MudyHub.
-  // --------------------------------------------------------------------------
-  app.get('/api/data-airtime/wallet', async (req, res) => {
-    try {
-      const uid = await authenticatedUid(req);
-      const snap = await db.ref(`users/${uid}/walletBalance`).once('value');
-      const balance = Number(snap.val() || 0);
-      if (!Number.isFinite(balance) || balance < 0) {
-        return res.status(503).json({ ok: false, error: 'Your wallet balance is temporarily unavailable.' });
-      }
-      return res.json({ ok: true, balance, walletBalance: balance, available: balance });
-    } catch (error) {
-      return sendError(res, error, 'Could not load wallet balance.');
-    }
-  });
+  
 
   // --------------------------------------------------------------------------
   // CUSTOMER: public conversion configuration. Receiver numbers must be set
