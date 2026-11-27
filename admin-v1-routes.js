@@ -709,7 +709,7 @@ export default function registerAdminV1({
   // ---------- Data manager (super admin only). Every action is logged.
   const DATA_PATH = /^[A-Za-z0-9_-]+(\/[A-Za-z0-9_-]+)*$/;
   const PROTECTED_NODES = ['admins', 'adminRoles', 'adminAuditLog', 'platformSettings', 'users', 'walletLedger',
-    'walletTopups', 'withdrawalRequests', 'pendingPayouts', 'platformRevenue', 'verificationApplications', 'companies', 'campusVerifications'];
+    'walletTopups', 'withdrawalRequests', 'pendingPayouts', 'platformRevenue', 'verificationApplications', 'companies', 'campusVerifications', 'airtimeCashRequests', 'dataAirtimeOrders'];
   const checkDataPath = p => {
     const s = String(p || '').trim().replace(/^\/+|\/+$/g, '');
     if (!s || s.length > 300 || !DATA_PATH.test(s)) throw new Error('Enter a valid path, for example statuses or users/abc123.');
@@ -773,7 +773,7 @@ export default function registerAdminV1({
   });
 
   // ---------- Browser: open any node and see its children (super admin only)
-  const ROOT_NODES = ['adminAuditLog', 'adminCreatedTasks', 'adminItemSubmissions', 'admin_logs', 'admins', 'adminRoles',
+  const ROOT_NODES = ['adminAuditLog', 'adminCreatedTasks', 'airtimeCashRequests', 'dataAirtimeOrders', 'serviceCatalog', 'adminItemSubmissions', 'admin_logs', 'admins', 'adminRoles',
     'aiLogs', 'aiUsage', 'blocks', 'calls', 'campaigns', 'campusFeed', 'campusVerifications', 'chatMembers', 'comments',
     'companies', 'dailyClaims', 'dataTrash', 'followers', 'following', 'graduateJobs', 'groups', 'guides', 'jobApplicants',
     'jobs', 'messages', 'moderatedContent', 'notifications', 'pendingPayouts', 'pendingReferrals', 'platformRevenue',
@@ -2165,4 +2165,215 @@ export default function registerAdminV1({
       suspended: true
     };
   });
+
+  // ------------------------------------------------------------
+  // AIRTIME TO CASH — ADMIN REVIEW
+  // The user sends airtime to MudyHub's line and submits a request (data-airtime-routes.js).
+  // An admin checks the line, then confirms: the wallet is credited ONCE, with a ledger entry,
+  // a notification and an audit record. Permission: "airtimeCash" (assigned by the Super Admin) or Super Admin.
+  // ------------------------------------------------------------
+
+  const CASH_NODE = 'airtimeCashRequests';
+  const CASH_ID = /^acr_[a-f0-9]{32}$/;
+  const CASH_NETWORKS = ['MTN', 'AIRTEL', 'GLO', '9MOBILE'];
+  const CASH_STATUSES = ['pending', 'processing', 'credited', 'rejected', 'cancelled'];
+  const cashInt = (v, fallback, min, max) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= min && n <= max ? Math.floor(n) : fallback;
+  };
+  const readCashSettings = async () => {
+    const r = (await val('serviceCatalog/airtimeToCash')) || {};
+    const networks = {};
+    for (const net of CASH_NETWORKS) {
+      const n = (r.networks && r.networks[net]) || {};
+      const number = String(n.number || '').replace(/\s+/g, '');
+      networks[net] = { enabled: n.enabled === true && /^0\d{10}$/.test(number), number: /^0\d{10}$/.test(number) ? number : '' };
+    }
+    return {
+      enabled: r.enabled === true,
+      payoutPercent: cashInt(r.payoutPercent, 80, 1, 100),
+      minAmount: cashInt(r.minAmount, 500, 50, 1000000),
+      maxAmount: cashInt(r.maxAmount, 20000, 50, 1000000),
+      dailyLimit: cashInt(r.dailyLimit, 50000, 50, 10000000),
+      maxPending: cashInt(r.maxPending, 3, 1, 20),
+      networks
+    };
+  };
+
+  route('/api/admin/airtime-cash/list', async (req, b) => {
+    const actor = await requireAdmin(req, 'airtimeCash');
+    const wanted = CASH_STATUSES.includes(b.status) ? b.status : 'pending';
+    // "Waiting" also shows requests that were opened by an admin and never finished.
+    const statuses = wanted === 'pending' ? ['pending', 'processing'] : [wanted];
+
+    let rows = [];
+    for (const st of statuses) {
+      const snap = await db.ref(CASH_NODE).orderByChild('status').equalTo(st).limitToLast(100).once('value');
+      rows = rows.concat(Object.values(snap.val() || {}).filter(r => r && r.id));
+    }
+    rows.sort((a, c) => Number(c.createdAt || 0) - Number(a.createdAt || 0));
+    rows = rows.slice(0, 100);
+
+    const uids = [...new Set(rows.map(r => r.uid).filter(Boolean))];
+    const users = {};
+    await Promise.all(uids.map(async uid => { users[uid] = (await val(`users/${uid}`)) || {}; }));
+
+    // Same sender number and amount twice within a day is flagged for the admin to look at closely.
+    const items = rows.map(r => {
+      const u = users[r.uid] || {};
+      const twin = rows.some(o => o.id !== r.id && o.senderPhone === r.senderPhone && o.amount === r.amount &&
+        Math.abs(Number(o.createdAt || 0) - Number(r.createdAt || 0)) < 24 * 60 * 60 * 1000);
+      return {
+        id: r.id, uid: r.uid,
+        fullName: clean(u.fullName || u.fullname || u.name, 100), username: clean(u.username, 40),
+        userBanned: u.banned === true || u.status === 'banned', userFrozen: u.walletFrozen === true,
+        network: r.network, senderPhone: r.senderPhone, amount: Number(r.amount || 0),
+        payoutPercent: Number(r.payoutPercent || 0), expectedPayout: Number(r.expectedPayout || 0), fee: Number(r.fee || 0),
+        receivingNumber: r.receivingNumber || '', reference: r.reference || null, status: r.status,
+        createdAt: Number(r.createdAt || 0), updatedAt: Number(r.updatedAt || 0),
+        receivedAmount: r.receivedAmount != null ? Number(r.receivedAmount) : null,
+        creditedAmount: r.creditedAmount != null ? Number(r.creditedAmount) : null,
+        reviewNote: clean(r.reviewNote, 300), rejectReason: clean(r.rejectReason, 300),
+        reviewedByName: clean(r.reviewedByName, 80), reviewedAt: Number(r.reviewedAt || 0),
+        possibleDuplicate: twin
+      };
+    });
+    return { items, settings: await readCashSettings(), canEditSettings: actor.role === 'super_admin' };
+  });
+
+  route('/api/admin/airtime-cash/approve', async (req, b) => {
+    const actor = await requireAdmin(req, 'airtimeCash');
+    const id = clean(b.id, 60);
+    if (!CASH_ID.test(id)) throw new Error('Invalid request ID.');
+    const ref = db.ref(`${CASH_NODE}/${id}`);
+    const initial = await val(`${CASH_NODE}/${id}`);
+    if (!initial) throw new Error('Request not found.');
+    if (initial.status === 'credited') return { status: 'credited', alreadyCredited: true, credited: Number(initial.creditedAmount || 0) };
+
+    const claimedAmount = Number(initial.amount);
+    const received = b.receivedAmount === undefined || b.receivedAmount === null || b.receivedAmount === '' ? claimedAmount : Number(b.receivedAmount);
+    if (!Number.isSafeInteger(received) || received < 1 || received > claimedAmount) {
+      throw new Error(`Amount received must be a whole number, not more than ₦${claimedAmount.toLocaleString('en-NG')}.`);
+    }
+    const note = clean(b.note, 300);
+    if (received !== claimedAmount && note.length < 5) throw new Error('Explain why the amount received is different from the amount claimed (at least 5 characters).');
+    const percent = Number(initial.payoutPercent);
+    if (!Number.isFinite(percent) || percent < 1 || percent > 100) throw new Error('This request has an invalid payout rate. Reject it and ask the user to submit again.');
+    const payout = Math.floor(received * percent / 100);
+    if (payout < 1) throw new Error('The payout would be less than ₦1.');
+
+    const user = await val(`users/${initial.uid}`);
+    if (!user) throw new Error('The user account no longer exists.');
+    if (user.banned === true || user.status === 'banned') throw new Error('This account is banned. Reject the request instead.');
+    if (user.walletFrozen === true) throw new Error('This wallet is frozen. Unfreeze it first, or reject the request.');
+
+    // Only one admin can work on a request at a time. A request abandoned for 2 minutes can be taken over.
+    const t0 = Date.now();
+    const claim = await ref.transaction(cur => {
+      if (!cur) return;
+      if (cur.status === 'pending') return { ...cur, status: 'processing', processingBy: actor.uid, processingAt: t0, updatedAt: t0 };
+      if (cur.status === 'processing' && t0 - Number(cur.processingAt || 0) > 120000) return { ...cur, processingBy: actor.uid, processingAt: t0, updatedAt: t0 };
+      return;
+    });
+    if (!claim.committed) {
+      const cur = await val(`${CASH_NODE}/${id}`);
+      if (cur && cur.status === 'credited') return { status: 'credited', alreadyCredited: true, credited: Number(cur.creditedAmount || 0) };
+      throw new Error(cur ? `This request is "${cur.status}" and cannot be credited now.` : 'Request not found.');
+    }
+
+    const claimKey = `airtimecash_${id}`;
+    let credited = payout;
+    try {
+      // creditOnce guarantees the wallet is credited only once for this request, even if this route runs again.
+      const { already } = await creditOnce(initial.uid, claimKey, payout);
+      if (already) {
+        const prior = await val(`users/${initial.uid}/adminRefundClaims/${claimKey}`);
+        if (prior && Number(prior.amount) > 0) credited = Number(prior.amount);
+      }
+      const stamp = Date.now();
+      await ref.update({
+        status: 'credited', receivedAmount: received, creditedAmount: credited,
+        reviewedBy: actor.uid, reviewedByName: clean(actor.name || 'Admin', 80), reviewedAt: stamp,
+        reviewNote: note, updatedAt: stamp, processingBy: null, processingAt: null
+      });
+
+      const desc = `Airtime to Cash: ₦${received.toLocaleString('en-NG')} ${initial.network}`;
+      const entry = { id: claimKey, type: 'airtime_to_cash', direction: 'credit', amount: credited, reference: id, description: desc, status: 'completed', createdAt: stamp };
+      const results = await Promise.allSettled([
+        db.ref(`walletLedger/${initial.uid}/${claimKey}`).set({ ...entry, adminUid: actor.uid }),
+        db.ref(`users/${initial.uid}/transactions/${claimKey}`).set(entry),
+        db.ref(`notifications/${initial.uid}/${claimKey}`).set({
+          type: 'airtime_to_cash', amount: credited, read: false, createdAt: stamp,
+          message: `Your Airtime to Cash request was approved. ₦${credited.toLocaleString('en-NG')} has been credited to your wallet.`
+        }),
+        writeAudit(actor, 'airtime_cash_credit', 'airtimeCash', id, note || 'Airtime received and verified.',
+          { status: 'pending', claimedAmount }, { status: 'credited', received, credited, uid: initial.uid })
+      ]);
+      results.forEach((r, i) => { if (r.status === 'rejected') console.error('[AIRTIME-CASH] record', i, 'failed for', id, r.reason?.message); });
+      return { status: 'credited', credited, received };
+    } catch (e) {
+      // Safe to put it back in the queue: a second attempt cannot credit twice (see creditOnce).
+      await ref.transaction(cur => (cur && cur.status === 'processing' && cur.processingBy === actor.uid)
+        ? { ...cur, status: 'pending', processingBy: null, processingAt: null, updatedAt: Date.now() } : undefined).catch(() => {});
+      throw e;
+    }
+  });
+
+  route('/api/admin/airtime-cash/reject', async (req, b) => {
+    const actor = await requireAdmin(req, 'airtimeCash');
+    const id = clean(b.id, 60);
+    if (!CASH_ID.test(id)) throw new Error('Invalid request ID.');
+    const reason = requireReason(b.reason, 5);
+    const ref = db.ref(`${CASH_NODE}/${id}`);
+    const stamp = Date.now();
+    const result = await ref.transaction(cur => {
+      if (!cur || cur.status !== 'pending') return;
+      return { ...cur, status: 'rejected', rejectReason: reason, reviewedBy: actor.uid, reviewedByName: clean(actor.name || 'Admin', 80), reviewedAt: stamp, updatedAt: stamp };
+    });
+    if (!result.committed) {
+      const cur = await val(`${CASH_NODE}/${id}`);
+      throw new Error(cur ? `This request is "${cur.status}" and cannot be rejected now.` : 'Request not found.');
+    }
+    const r = result.snapshot.val();
+    await db.ref(`notifications/${r.uid}/airtimecash_${id}`).set({
+      type: 'airtime_to_cash', read: false, createdAt: stamp,
+      message: `Your Airtime to Cash request for ₦${Number(r.amount).toLocaleString('en-NG')} ${r.network} was not approved. Reason: ${reason}`
+    }).catch(() => {});
+    await writeAudit(actor, 'airtime_cash_reject', 'airtimeCash', id, reason, { status: 'pending' }, { status: 'rejected', uid: r.uid }).catch(e => console.error('[AIRTIME-CASH] audit failed', e.message));
+    return { status: 'rejected' };
+  });
+
+  // Receiving numbers, rate and limits. Super Admin only; every change is logged.
+  route('/api/admin/airtime-cash/settings', async (req, b) => {
+    const actor = await requireAdmin(req);
+    if (actor.role !== 'super_admin') throw new Error('Forbidden');
+    const reason = clean(b.reason, 300) || 'Airtime to Cash settings updated.';
+    const payoutPercent = Number(b.payoutPercent);
+    const minAmount = Number(b.minAmount), maxAmount = Number(b.maxAmount);
+    const dailyLimit = Number(b.dailyLimit), maxPending = Number(b.maxPending);
+    if (!Number.isInteger(payoutPercent) || payoutPercent < 50 || payoutPercent > 100) throw new Error('The payout rate must be a whole number from 50 to 100 (the percentage the user receives).');
+    if (!Number.isInteger(minAmount) || minAmount < 50) throw new Error('The minimum amount must be at least ₦50.');
+    if (!Number.isInteger(maxAmount) || maxAmount < minAmount || maxAmount > 1000000) throw new Error('The maximum amount must be at least the minimum, and not more than ₦1,000,000.');
+    if (!Number.isInteger(dailyLimit) || dailyLimit < maxAmount) throw new Error('The daily limit must be at least the maximum amount.');
+    if (!Number.isInteger(maxPending) || maxPending < 1 || maxPending > 20) throw new Error('Waiting requests per user must be from 1 to 20.');
+
+    const networks = {};
+    for (const net of CASH_NETWORKS) {
+      const n = (b.networks && b.networks[net]) || {};
+      const number = String(n.number || '').replace(/\s+/g, '');
+      const enabled = n.enabled === true;
+      if (number && !/^0\d{10}$/.test(number)) throw new Error(`The ${net} number must be 11 digits starting with 0.`);
+      if (enabled && !number) throw new Error(`Enter the ${net} receiving number before turning ${net} on.`);
+      networks[net] = { enabled, number };
+    }
+    const enabled = b.enabled === true;
+    if (enabled && !Object.values(networks).some(n => n.enabled)) throw new Error('Turn on at least one network before enabling Airtime to Cash.');
+
+    const before = await readCashSettings();
+    const next = { enabled, payoutPercent, minAmount, maxAmount, dailyLimit, maxPending, networks, updatedAt: Date.now(), updatedBy: actor.uid };
+    await db.ref('serviceCatalog/airtimeToCash').set(next);
+    await writeAudit(actor, 'airtime_cash_settings', 'airtimeCash', 'settings', reason, before, { enabled, payoutPercent, minAmount, maxAmount, dailyLimit, maxPending, networks });
+    return { settings: await readCashSettings() };
+  });
+
 }
