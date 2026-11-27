@@ -142,7 +142,19 @@ export default function registerStorage({ app, admin, db, authenticatedUid, requ
                 const u = (await db.ref(`users/${id}/username`).once("value")).val();
                 names[id] = typeof u === "string" ? u : "";
             }));
-            return res.json({ ok: true, reels: rows.map(r => ({ ...r, username: names[r.userId] || "" })) });
+            // Counts for each reel: views and comments.
+            const counts = {};
+            await Promise.all(rows.map(async r => {
+                const [views, comments] = await Promise.all([
+                    db.ref(`posts/${r.id}/views`).once("value"),
+                    db.ref(`comments/${r.id}`).once("value")
+                ]);
+                counts[r.id] = {
+                    views: views.exists() ? Object.keys(views.val() || {}).length : 0,
+                    comments: comments.exists() ? Object.keys(comments.val() || {}).length : 0
+                };
+            }));
+            return res.json({ ok: true, reels: rows.map(r => ({ ...r, username: names[r.userId] || "", viewCount: counts[r.id].views, commentCount: counts[r.id].comments })) });
         } catch (e) {
             console.error("[reels]", e.message);
             return res.status(e.status || 500).json({ error: e.status ? e.message : "Reels could not load. Please try again." });
