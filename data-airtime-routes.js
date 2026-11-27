@@ -776,6 +776,59 @@ export default function registerDataAirtime({ app, db, authenticatedUid, require
     }
   });
 
+  
+  // ==========================================================================
+  // CUSTOMER: MUDYHUB WALLET BALANCE
+  // GET /api/data-airtime/wallet
+  // ==========================================================================
+  app.get('/api/data-airtime/wallet', async (req, res) => {
+    try {
+      const uid = await authenticatedUid(req);
+
+      const snap = await db
+        .ref(`users/${uid}/walletBalance`)
+        .once('value');
+
+      const rawBalance = snap.val();
+      const balance = rawBalance === null ? 0 : Number(rawBalance);
+
+      if (!Number.isFinite(balance) || balance < 0) {
+        return res.status(500).json({
+          ok: false,
+          error: 'Your wallet balance is temporarily unavailable.'
+        });
+      }
+
+      const userSnap = await db.ref(`users/${uid}`).once('value');
+const user = userSnap.val() || {};
+
+return res.json({
+  ok: true,
+  balance,
+  walletBalance: balance,
+  currency: 'NGN',
+  pinSet: Boolean(user.pinHash),
+  restricted:
+    user.banned === true ||
+    user.status === 'banned' ||
+    user.walletFrozen === true
+});
+      
+    } catch (error) {
+      console.error('[DATA-AIRTIME] Wallet balance error:', error);
+
+      return res.status(
+        error.message === 'Unauthorized' ? 401 : 500
+      ).json({
+        ok: false,
+        error: error.message === 'Unauthorized'
+          ? 'Unauthorized'
+          : 'Could not load your wallet balance.'
+      });
+    }
+  });
+        
+
   // ==========================================================================
   // SUPER ADMIN: PROVIDER WALLET BALANCE
   // ==========================================================================
