@@ -356,6 +356,7 @@ export function registerAirtimeCash({
         updatedAt: now(),
         updatedBy: actor.uid || actor.id || 'super_admin'
       };
+      await configRef.set(config);
 
             if (typeof writeAudit === 'function') {
         await writeAudit(
