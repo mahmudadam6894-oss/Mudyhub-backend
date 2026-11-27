@@ -1462,88 +1462,45 @@ async function authenticatedUid(req) {
 // FIREBASE EMAIL VERIFICATION — delivered through Brevo
 // Firebase creates and validates the action link; Brevo only delivers it.
 // -----------------------------------------------------
-
 const emailVerificationLastSent = new Map();
-
 const EMAIL_VERIFICATION_COOLDOWN_MS = 60_000;
-
 const EMAIL_VERIFICATION_CONTINUE_URL =
   process.env.EMAIL_VERIFICATION_CONTINUE_URL ||
   "https://mudyhub.pages.dev/signup.html?emailVerified=1";
 
-// Escape values before inserting them into HTML.
 function escapeEmailHtml(value) {
   return String(value || "").replace(/[&<>"']/g, char => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;"
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   })[char]);
 }
 
 app.post("/api/auth/send-email-verification", async (req, res) => {
   let uid;
-
-  // 1. Authenticate the requesting user.
   try {
     uid = await authenticatedUid(req);
   } catch (_) {
-    return res.status(401).json({
-      ok: false,
-      error: "Please sign in again."
-    });
+    return res.status(401).json({ ok: false, error: "Please sign in again." });
   }
 
   try {
-    // 2. Check Firebase account.
     const user = await admin.auth().getUser(uid);
-
     if (user.disabled) {
-      return res.status(403).json({
-        ok: false,
-        error: "This account is not available."
-      });
+      return res.status(403).json({ ok: false, error: "This account is not available." });
     }
-
     if (!user.email) {
-      return res.status(400).json({
-        ok: false,
-        error: "Your account has no email address."
-      });
+      return res.status(400).json({ ok: false, error: "Your account has no email address." });
     }
-
     if (user.emailVerified) {
-      return res.json({
-        ok: true,
-        alreadyVerified: true,
-        message: "Your email address is already verified."
-      });
+      return res.json({ ok: true, alreadyVerified: true });
+    }
+    if (!process.env.BREVO_API_KEY) {
+      console.error("[Email verification] BREVO_API_KEY is not configured.");
+      return res.status(503).json({ ok: false, error: "Email delivery is temporarily unavailable." });
     }
 
-    // 3. Check Brevo configuration.
-    const brevoApiKey = process.env.BREVO_API_KEY;
-    const senderEmail = process.env.BREVO_SENDER_EMAIL;
-    const senderName = process.env.BREVO_SENDER_NAME || "MudyHub";
-
-    if (!brevoApiKey || !senderEmail) {
-      console.error(
-        "[Email verification] BREVO_API_KEY or BREVO_SENDER_EMAIL is missing."
-      );
-
-      return res.status(503).json({
-        ok: false,
-        error: "Email delivery is temporarily unavailable."
-      });
-    }
-
-    // 4. Apply resend cooldown.
     const now = Date.now();
     const lastSent = emailVerificationLastSent.get(uid) || 0;
-
-    const remaining =
-      EMAIL_VERIFICATION_COOLDOWN_MS - (now - lastSent);
-
+    const remaining = EMAIL_VERIFICATION_COOLDOWN_MS - (now - lastSent);
     if (remaining > 0) {
       return res.status(429).json({
         ok: false,
@@ -1552,557 +1509,238 @@ app.post("/api/auth/send-email-verification", async (req, res) => {
       });
     }
 
-    // Record attempt before generating and sending the email.
+    // Record the attempt before contacting Brevo to prevent rapid duplicate sends.
     emailVerificationLastSent.set(uid, now);
 
-    // 5. Generate Firebase verification link.
-    const actionLink =
-      await admin.auth().generateEmailVerificationLink(
-        user.email,
-        {
-          url: EMAIL_VERIFICATION_CONTINUE_URL,
-          handleCodeInApp: false
-        }
-      );
-
-    // 6. Prepare safe email values.
-    const displayName = user.displayName || "MudyHub member";
-
-    const recipientName = escapeEmailHtml(displayName);
-    const recipientEmail = escapeEmailHtml(user.email);
-    const safeActionLink = escapeEmailHtml(actionLink);
-
-    // 7. Build HTML email.
-    const htmlContent = `
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Verify your MudyHub email</title>
-</head>
-
-<body style="margin:0;padding:24px;background:#f5f5f5;font-family:Arial,sans-serif;color:#171717">
-
-  <div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:16px;padding:32px 24px">
-
-    <div style="font-size:26px;font-weight:800;color:#111111">
-      Mudy<span style="color:#d6a900">Hub</span>
-    </div>
-
-    <h1 style="font-size:23px;margin:28px 0 12px">
-      Verify your email address
-    </h1>
-
-    <p style="line-height:1.6">
-      Hello ${recipientName},
-    </p>
-
-    <p style="line-height:1.6">
-      Please confirm that
-      <strong>${recipientEmail}</strong>
-      belongs to you by clicking the button below.
-    </p>
-
-    <p style="margin:28px 0">
-      <a
-        href="${safeActionLink}"
-        style="display:inline-block;background:#ffcc00;color:#111111;text-decoration:none;font-weight:700;padding:14px 22px;border-radius:10px"
-      >
-        Verify Email Address
-      </a>
-    </p>
-
-    <p style="font-size:13px;line-height:1.6;color:#666">
-      If the button does not work, copy and paste this link into your browser:
-      <br>
-      <a
-        href="${safeActionLink}"
-        style="color:#8a6b00;word-break:break-all"
-      >${safeActionLink}</a>
-    </p>
-
-    <p style="font-size:13px;line-height:1.6;color:#777">
-      If you did not create a MudyHub account, you can ignore this email.
-    </p>
-
-    <hr style="border:0;border-top:1px solid #eeeeee;margin:28px 0">
-
-    <p style="font-size:12px;color:#999">
-      MudyHub · Learn. Work. Earn. Grow.
-    </p>
-
-  </div>
-
-</body>
-</html>`;
-
-    // 8. Prepare plain-text alternative.
-    const textContent =
-      `Hello ${displayName},\n\n` +
-      `Please verify your MudyHub email address (${user.email}) using this link:\n` +
-      `${actionLink}\n\n` +
-      `If you did not create a MudyHub account, ignore this email.`;
-
-    // 9. Send verification email through Brevo.
-    const brevoResponse = await fetch(
-      "https://api.brevo.com/v3/smtp/email",
+    const actionLink = await admin.auth().generateEmailVerificationLink(
+      user.email,
       {
-        method: "POST",
-
-        headers: {
-          "accept": "application/json",
-          "api-key": brevoApiKey,
-          "content-type": "application/json"
-        },
-
-        body: JSON.stringify({
-          sender: {
-            name: senderName,
-            email: senderEmail
-          },
-
-          to: [{
-            email: user.email,
-            name: displayName
-          }],
-
-          subject: "Verify your MudyHub email address",
-          htmlContent,
-          textContent
-        })
+        url: EMAIL_VERIFICATION_CONTINUE_URL,
+        handleCodeInApp: false
       }
     );
 
-    // 10. Handle Brevo rejection.
+    const recipientName = escapeEmailHtml(user.displayName || "MudyHub member");
+    const recipientEmail = escapeEmailHtml(user.email);
+    const safeActionLink = escapeEmailHtml(actionLink);
+    const senderEmail = process.env.BREVO_SENDER_EMAIL || "mahmudadam6894@gmail.com";
+    const senderName = process.env.BREVO_SENDER_NAME || "MudyHub";
+
+    const htmlContent = `
+      <!doctype html>
+      <html lang="en">
+      <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+      <body style="margin:0;padding:24px;background:#f5f5f5;font-family:Arial,sans-serif;color:#171717">
+        <div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:16px;padding:32px 24px">
+          <div style="font-size:26px;font-weight:800;color:#111111">Mudy<span style="color:#d6a900">Hub</span></div>
+          <h1 style="font-size:23px;margin:28px 0 12px">Verify your email address</h1>
+          <p style="line-height:1.6">Hello ${recipientName},</p>
+          <p style="line-height:1.6">Please confirm that <strong>${recipientEmail}</strong> belongs to you by clicking the button below.</p>
+          <p style="margin:28px 0">
+            <a href="${safeActionLink}" style="display:inline-block;background:#ffcc00;color:#111111;text-decoration:none;font-weight:700;padding:14px 22px;border-radius:10px">Verify Email Address</a>
+          </p>
+          <p style="font-size:13px;line-height:1.6;color:#666">If the button does not work, copy and paste this link into your browser:<br><a href="${safeActionLink}" style="color:#8a6b00;word-break:break-all">${safeActionLink}</a></p>
+          <p style="font-size:13px;line-height:1.6;color:#777">If you did not create a MudyHub account, you can ignore this email.</p>
+          <hr style="border:0;border-top:1px solid #eeeeee;margin:28px 0">
+          <p style="font-size:12px;color:#999">MudyHub · Learn. Work. Earn. Grow.</p>
+        </div>
+      </body>
+      </html>`;
+
+    const textContent =
+      `Hello ${user.displayName || "MudyHub member"},\n\n` +
+      `Please verify your MudyHub email address (${user.email}) using this link:\n${actionLink}\n\n` +
+      `If you did not create a MudyHub account, ignore this email.`;
+
+    const brevoResponse = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        "accept": "application/json",
+        "api-key": process.env.BREVO_API_KEY,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        sender: { name: senderName, email: senderEmail },
+        to: [{ email: user.email, name: user.displayName || "MudyHub member" }],
+        subject: "Verify your MudyHub email address",
+        htmlContent,
+        textContent
+      })
+    });
+
     if (!brevoResponse.ok) {
-      const providerMessage =
-        await brevoResponse.text().catch(() => "");
-
-      console.error(
-        "[Email verification] Brevo rejected the message:",
-        brevoResponse.status,
-        providerMessage.slice(0, 300)
-      );
-
+      const providerMessage = await brevoResponse.text().catch(() => "");
+      console.error("[Email verification] Brevo rejected the message:", brevoResponse.status, providerMessage.slice(0, 300));
       emailVerificationLastSent.delete(uid);
-
-      return res.status(502).json({
-        ok: false,
-        error: "We could not send your verification email. Please try again."
-      });
+      return res.status(502).json({ ok: false, error: "We could not send your verification email. Please try again." });
     }
 
-    // 11. Successful delivery request.
-    return res.json({
-      ok: true,
-      message: "Verification email sent."
-    });
-
+    return res.json({ ok: true, message: "Verification email sent." });
   } catch (error) {
     emailVerificationLastSent.delete(uid);
-
-    console.error(
-      "[Email verification] Request failed:",
-      error.message
-    );
-
-    return res.status(500).json({
-      ok: false,
-      error: "We could not send your verification email. Please try again."
-    });
+    console.error("[Email verification] Request failed:", error.message);
+    return res.status(500).json({ ok: false, error: "We could not send your verification email. Please try again." });
   }
 });
 
-// -----------------------------------------------------
-// PASSWORD RESET — Firebase creates the reset link;
-// Brevo delivers it.
-// Account lookup results are never exposed to the caller.
-// -----------------------------------------------------
 
+
+// -----------------------------------------------------
+// PASSWORD RESET — Firebase creates the reset action; Brevo delivers it.
+// The public response is deliberately identical for known/unknown emails.
+// -----------------------------------------------------
 const passwordResetLastSent = new Map();
-
 const PASSWORD_RESET_COOLDOWN_MS = 5 * 60_000;
-
 const PASSWORD_RESET_CONTINUE_URL =
   process.env.PASSWORD_RESET_CONTINUE_URL ||
   "https://mudyhub.pages.dev/login.html?passwordReset=1";
-
 const passwordResetGenericResponse = {
   ok: true,
-  message:
-    "If an eligible MudyHub account exists for that email, a password reset link will be sent. Check your inbox and spam folder."
+  message: "If an eligible MudyHub account exists for that email, a password reset link will be sent. Check your inbox and spam folder."
 };
 
 app.post("/api/auth/request-password-reset", async (req, res) => {
-
-  // 1. Validate email.
-  const email = String(req.body?.email || "")
-    .trim()
-    .toLowerCase();
-
-  if (
-    !email ||
-    email.length > 320 ||
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
-  ) {
-    return res.status(400).json({
-      ok: false,
-      error: "Enter a valid email address."
-    });
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!email || email.length > 320 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ ok: false, error: "Enter a valid email address." });
   }
 
-  // 2. Create a privacy-preserving rate-limit key.
   const ip = String(req.ip || "unknown");
-
-  const resetKey = crypto
-    .createHash("sha256")
-    .update(`${ip}|${email}`)
-    .digest("hex");
-
+  const resetKey = crypto.createHash("sha256").update(`${ip}|${email}`).digest("hex");
   const now = Date.now();
-
   const lastSent = passwordResetLastSent.get(resetKey) || 0;
-
-  // Return the same generic response during cooldown.
   if (now - lastSent < PASSWORD_RESET_COOLDOWN_MS) {
     return res.json(passwordResetGenericResponse);
   }
 
-  // Record before account lookup.
+  // Store before lookup so repeated requests cannot probe or hammer account lookup.
   passwordResetLastSent.set(resetKey, now);
 
   try {
-
-    // 3. Check Brevo configuration.
-    const brevoApiKey = process.env.BREVO_API_KEY;
-    const senderEmail = process.env.BREVO_SENDER_EMAIL;
-    const senderName = process.env.BREVO_SENDER_NAME || "MudyHub";
-
-    if (!brevoApiKey || !senderEmail) {
-      console.error(
-        "[Password reset] BREVO_API_KEY or BREVO_SENDER_EMAIL is missing."
-      );
-
+    if (!process.env.BREVO_API_KEY) {
+      console.error("[Password reset] BREVO_API_KEY is not configured.");
       return res.json(passwordResetGenericResponse);
     }
 
-    // 4. Find Firebase account without revealing whether it exists.
-    const userRecord = await admin.auth()
-      .getUserByEmail(email)
-      .catch(() => null);
-
+    const userRecord = await admin.auth().getUserByEmail(email).catch(() => null);
     if (!userRecord || userRecord.disabled || !userRecord.email) {
       return res.json(passwordResetGenericResponse);
     }
 
-    // 5. Require a matching MudyHub profile.
-    const profileSnap = await db
-      .ref(`users/${userRecord.uid}`)
-      .once("value");
-
+    // Require a matching MudyHub profile; do not expose lookup results to the caller.
+    const profileSnap = await db.ref(`users/${userRecord.uid}`).once("value");
     const profile = profileSnap.val();
-
-    if (
-      !profile ||
-      String(profile.email || "").trim().toLowerCase() !== email
-    ) {
+    if (!profile || String(profile.email || "").trim().toLowerCase() !== email) {
       return res.json(passwordResetGenericResponse);
     }
 
-    // 6. Generate Firebase password-reset link.
-    const actionLink = await admin.auth()
-      .generatePasswordResetLink(email, {
-        url: PASSWORD_RESET_CONTINUE_URL,
-        handleCodeInApp: false
-      });
-
-    // 7. Prepare safe email values.
+    const actionLink = await admin.auth().generatePasswordResetLink(email, {
+      url: PASSWORD_RESET_CONTINUE_URL,
+      handleCodeInApp: false
+    });
     const safeLink = escapeEmailHtml(actionLink);
+    const senderEmail = process.env.BREVO_SENDER_EMAIL || "mahmudadam6894@gmail.com";
+    const senderName = process.env.BREVO_SENDER_NAME || "MudyHub";
+    const name = escapeEmailHtml(profile.fullName || userRecord.displayName || "MudyHub member");
 
-    const displayName =
-      profile.fullName ||
-      userRecord.displayName ||
-      "MudyHub member";
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "api-key": process.env.BREVO_API_KEY,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        sender: { name: senderName, email: senderEmail },
+        to: [{ email, name }],
+        subject: "Reset your MudyHub password",
+        htmlContent: `<!doctype html><html><body style="font-family:Arial,sans-serif;background:#f5f5f5;padding:24px;color:#171717"><main style="max-width:560px;margin:auto;background:#fff;padding:28px;border-radius:14px"><h2>MudyHub password reset</h2><p>Hello ${name},</p><p>We received a request to reset your MudyHub password.</p><p><a href="${safeLink}" style="display:inline-block;background:#ffcc00;color:#111;padding:13px 20px;border-radius:8px;text-decoration:none;font-weight:bold">Reset Password</a></p><p>If the button does not work, open this link:</p><p style="word-break:break-all">${safeLink}</p><p>If you did not request this, you can ignore this email.</p></main></body></html>`,
+        textContent: `Hello ${profile.fullName || "MudyHub member"},\n\nReset your MudyHub password using this link:\n${actionLink}\n\nIf you did not request this, ignore this email.`
+      })
+    });
 
-    const safeName = escapeEmailHtml(displayName);
-
-    // 8. Build HTML email.
-    const htmlContent = `
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Reset your MudyHub password</title>
-</head>
-
-<body style="font-family:Arial,sans-serif;background:#f5f5f5;padding:24px;color:#171717">
-
-  <main style="max-width:560px;margin:auto;background:#fff;padding:28px;border-radius:14px">
-
-    <div style="font-size:26px;font-weight:800;color:#111">
-      Mudy<span style="color:#d6a900">Hub</span>
-    </div>
-
-    <h2>Password reset request</h2>
-
-    <p>Hello ${safeName},</p>
-
-    <p>
-      We received a request to reset your MudyHub password.
-      Click the button below to choose a new password.
-    </p>
-
-    <p style="margin:28px 0">
-      <a
-        href="${safeLink}"
-        style="display:inline-block;background:#ffcc00;color:#111;padding:13px 20px;border-radius:8px;text-decoration:none;font-weight:bold"
-      >
-        Reset Password
-      </a>
-    </p>
-
-    <p>If the button does not work, open this link:</p>
-
-    <p style="word-break:break-all">
-      <a href="${safeLink}">${safeLink}</a>
-    </p>
-
-    <p style="font-size:13px;color:#777">
-      If you did not request this, you can safely ignore this email.
-    </p>
-
-    <hr style="border:0;border-top:1px solid #eee;margin:25px 0">
-
-    <p style="font-size:12px;color:#999">
-      MudyHub · Learn. Work. Earn. Grow.
-    </p>
-
-  </main>
-
-</body>
-</html>`;
-
-    // 9. Plain-text alternative.
-    const textContent =
-      `Hello ${displayName},\n\n` +
-      `We received a request to reset your MudyHub password.\n\n` +
-      `Use this link to reset it:\n${actionLink}\n\n` +
-      `If you did not request this, ignore this email.`;
-
-    // 10. Send through Brevo.
-    const brevoResponse = await fetch(
-      "https://api.brevo.com/v3/smtp/email",
-      {
-        method: "POST",
-
-        headers: {
-          accept: "application/json",
-          "api-key": brevoApiKey,
-          "content-type": "application/json"
-        },
-
-        body: JSON.stringify({
-          sender: {
-            name: senderName,
-            email: senderEmail
-          },
-
-          to: [{
-            email,
-            name: displayName
-          }],
-
-          subject: "Reset your MudyHub password",
-          htmlContent,
-          textContent
-        })
-      }
-    );
-
-    // 11. Handle Brevo failure.
-    if (!brevoResponse.ok) {
-      const providerMessage =
-        await brevoResponse.text().catch(() => "");
-
-      console.error(
-        "[Password reset] Brevo rejected the message:",
-        brevoResponse.status,
-        providerMessage.slice(0, 300)
-      );
-
+    if (!response.ok) {
+      const providerMessage = await response.text().catch(() => "");
+      console.error("[Password reset] Brevo rejected the message:", response.status, providerMessage.slice(0, 300));
       passwordResetLastSent.delete(resetKey);
     }
-
   } catch (error) {
-
-    console.error(
-      "[Password reset] Request failed:",
-      error.message
-    );
-
+    console.error("[Password reset] Request failed:", error.message);
     passwordResetLastSent.delete(resetKey);
   }
 
-  // 12. Always return the same public response.
   return res.json(passwordResetGenericResponse);
 });
 
-// -----------------------------------------------------
-// FINAL REGISTRATION ACTIVATION
-// Server verifies Firebase Auth state.
-// Client-submitted verification flags are never trusted.
-// -----------------------------------------------------
 
+// -----------------------------------------------------
+// FINAL REGISTRATION ACTIVATION — verify Firebase Auth state on the server.
+// Client-submitted emailVerified/phoneVerified values are never trusted.
+// -----------------------------------------------------
+// Phone verification stays built in but is optional until REQUIRE_PHONE_VERIFICATION=true is set on Render.
+const REQUIRE_PHONE_VERIFICATION = String(process.env.REQUIRE_PHONE_VERIFICATION || "").toLowerCase() === "true";
 app.post("/api/auth/complete-registration", async (req, res) => {
   let uid;
-
-  // 1. Authenticate the user.
   try {
     uid = await authenticatedUid(req);
   } catch (_) {
-    return res.status(401).json({
-      ok: false,
-      error: "Please sign in again."
-    });
+    return res.status(401).json({ ok: false, error: "Please sign in again." });
   }
 
   try {
-    // 2. Retrieve Firebase Auth account and MudyHub profile.
     const [authUser, profileSnap] = await Promise.all([
       admin.auth().getUser(uid),
       db.ref(`users/${uid}`).once("value")
     ]);
-
     const profile = profileSnap.val();
 
-    // 3. Confirm account and email consistency.
-    if (
-      authUser.disabled ||
-      !profile ||
-      !authUser.email ||
-      String(profile.email || "").trim().toLowerCase() !==
-        authUser.email.toLowerCase()
-    ) {
-      return res.status(403).json({
-        ok: false,
-        error: "Registration cannot be completed."
-      });
+    if (authUser.disabled || !profile || !authUser.email || String(profile.email || "").trim().toLowerCase() !== authUser.email.toLowerCase()) {
+      return res.status(403).json({ ok: false, error: "Registration cannot be completed." });
     }
-
-    // 4. Require verified email.
     if (!authUser.emailVerified) {
-      return res.status(409).json({
-        ok: false,
-        code: "EMAIL_NOT_VERIFIED",
-        error: "Verify your email address first."
-      });
+      return res.status(409).json({ ok: false, code: "EMAIL_NOT_VERIFIED", error: "Verify your email address first." });
+    }
+    if (REQUIRE_PHONE_VERIFICATION && !authUser.phoneNumber) {
+      return res.status(409).json({ ok: false, code: "PHONE_NOT_VERIFIED", error: "Verify your phone number first." });
+    }
+    const phoneIsVerified = !!authUser.phoneNumber;
+
+    const normalizedProfilePhone = String(profile.phone || "").replace(/[^+\d]/g, "");
+    const normalizedAuthPhone = String(authUser.phoneNumber || "").replace(/[^+\d]/g, "");
+    if (phoneIsVerified && (!normalizedProfilePhone || normalizedProfilePhone !== normalizedAuthPhone)) {
+      return res.status(409).json({ ok: false, code: "PHONE_MISMATCH", error: "The verified phone number does not match your saved profile number." });
     }
 
-    // 5. Require Firebase-verified phone number.
-    if (!authUser.phoneNumber) {
-      return res.status(409).json({
-        ok: false,
-        code: "PHONE_NOT_VERIFIED",
-        error: "Verify your phone number first."
-      });
+    const username = String(profile.username || "").trim().toLowerCase();
+    const fullName = String(profile.fullName || profile.fullname || "").trim();
+    const role = String(profile.role || "").trim();
+    const skill = String(profile.skill || profile.skills || "").trim();
+    if (!fullName || !/^[a-z0-9_]{3,20}$/.test(username) || !role || !skill) {
+      return res.status(409).json({ ok: false, code: "PROFILE_INCOMPLETE", error: "Complete your required profile details first." });
     }
 
-    // 6. Ensure verified phone matches saved profile phone.
-    const normalizedProfilePhone =
-      String(profile.phone || "").replace(/[^+\d]/g, "");
-
-    const normalizedAuthPhone =
-      String(authUser.phoneNumber || "").replace(/[^+\d]/g, "");
-
-    if (
-      !normalizedProfilePhone ||
-      normalizedProfilePhone !== normalizedAuthPhone
-    ) {
-      return res.status(409).json({
-        ok: false,
-        code: "PHONE_MISMATCH",
-        error: "The verified phone number does not match your saved profile number."
-      });
-    }
-
-    // 7. Validate required profile information.
-    const username =
-      String(profile.username || "").trim().toLowerCase();
-
-    const fullName =
-      String(profile.fullName || profile.fullname || "").trim();
-
-    const role =
-      String(profile.role || "").trim();
-
-    const skill =
-      String(profile.skill || profile.skills || "").trim();
-
-    if (
-      !fullName ||
-      !/^[a-z0-9_]{3,20}$/.test(username) ||
-      !role ||
-      !skill
-    ) {
-      return res.status(409).json({
-        ok: false,
-        code: "PROFILE_INCOMPLETE",
-        error: "Complete your required profile details first."
-      });
-    }
-
-    // 8. Confirm username reservation and public profile.
     const [usernameSnap, publicProfileSnap] = await Promise.all([
       db.ref(`usernameIndex/${username}`).once("value"),
       db.ref(`publicProfiles/${uid}`).once("value")
     ]);
-
-    const publicProfile = publicProfileSnap.val();
-
-    if (
-      usernameSnap.val() !== uid ||
-      !publicProfileSnap.exists() ||
-      publicProfile?.uid !== uid ||
-      publicProfile?.username !== username
-    ) {
-      return res.status(409).json({
-        ok: false,
-        code: "PROFILE_NOT_READY",
-        error: "Your profile setup is not complete. Please return to signup and try again."
-      });
+    if (usernameSnap.val() !== uid || !publicProfileSnap.exists() || publicProfileSnap.val()?.uid !== uid || publicProfileSnap.val()?.username !== username) {
+      return res.status(409).json({ ok: false, code: "PROFILE_NOT_READY", error: "Your profile setup is not complete. Please return to signup and try again." });
     }
 
-    // 9. Activate registration.
     const now = admin.database.ServerValue.TIMESTAMP;
-
     await db.ref(`users/${uid}`).update({
       emailVerified: true,
       emailVerifiedAt: now,
-      phoneVerified: true,
-      phoneVerifiedAt: now,
+      phoneVerified: phoneIsVerified,
+      ...(phoneIsVerified ? { phoneVerifiedAt: now } : {}),
       registrationStatus: "active",
       accountActivatedAt: now
     });
 
-    // 10. Successful activation.
-    return res.json({
-      ok: true,
-      registrationStatus: "active",
-      message: "Your MudyHub account is now active."
-    });
-
+    return res.json({ ok: true, registrationStatus: "active" });
   } catch (error) {
-    console.error(
-      "[Registration activation] Failed:",
-      error.message
-    );
-
-    return res.status(500).json({
-      ok: false,
-      error: "We could not complete your registration. Please try again."
-    });
+    console.error("[Registration activation] Failed:", error.message);
+    return res.status(500).json({ ok: false, error: "We could not complete your registration. Please try again." });
   }
 });
 
@@ -2507,7 +2145,7 @@ registerJobs({ app, admin, db, authenticatedUid });
 registerVerification({ app, admin, db, authenticatedUid, requireAdmin, writeAudit });
 registerStorage({ app, admin, db, authenticatedUid, requireAdmin });
 registerProfile({ app, admin, db, authenticatedUid });
-registerDataAirtime({ app, db, authenticatedUid, requireAdmin });
+registerDataAirtime({ app, db, authenticatedUid });
 app.get("/api/payment-config", async (req, res) => {
   const keys = paystackKeys();
   if (!keys.publicKey) return res.status(503).json({ error: `Paystack ${keys.mode} public key is not configured (it must start with pk_${keys.mode}_).` });
