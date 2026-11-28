@@ -4,6 +4,7 @@ import cors from 'cors';
 import admin from 'firebase-admin';
 import dotenv from 'dotenv';
 import registerTrueConnection from './true-connection-routes.js';
+import registerFootball from './football-routes.js';
 import registerAdminV1 from './admin-v1-routes.js';
 import registerPromote from './promote-routes.js';
 import registerTasks from './tasks-routes.js';
@@ -2138,6 +2139,7 @@ app.post('/api/admin/publish', async (req, res) => {
 
 // True Connection server routes: matching, eligibility, requests and moderation are server-only.
 registerTrueConnection({ app, admin, db, authenticatedUid, requireAdmin, writeAudit });
+registerFootball({ app, db, authenticatedUid });
 // V1 admin extras: user lookup/verify, verification (KYC) review, content moderation, mark-withdrawal-paid.
 registerAdminV1({ app, admin, db, requireAdmin, writeAudit, adminResponseError });
 registerPromote({ app, admin, db, authenticatedUid });
